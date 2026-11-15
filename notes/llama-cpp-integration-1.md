@@ -77,7 +77,45 @@ n = 4..7) and loads each activation chunk once for all its rows. NaN codes go th
   (notes/pytorch-ext-1.md). At n >= 7 variant A is bound by its multiply instructions: one v_fma_mix_f32 per weight
   per column plus about 2.5 per weight for widening and the NaN check (about 10-11 VALU per weight).
 
-## Options for n >= 7
+## Step 3: non-temporal weight loads; n = 7, 8 closed
+
+The step 2 kernel and the prototype's variant A compile to nearly the same loop (n = 8, 2 rows: 548 vs 539
+instructions, 360 vs 356 VALU, the same 34 global_load_b128), yet llama.cpp's was 8-13 % slower at n = 7, 8. The one
+difference: the prototype loads weights with `__builtin_nontemporal_load` (`global_load_b128 ... slc dlc`), the
+llama.cpp kernel without. Weights are read once while each activation chunk is reused by every row; streaming the
+weights past the cache keeps the activations in it. At 11 VALU per weight the kernel used only about 40 % of the
+measured instruction rate, so it was waiting on memory, not instruction-bound as stated in step 2.
+
+Experiments in llama.cpp's harness (temporary env override, removed; `build/runs/sweep-*.log`, 2 rounds each):
+
+| setting | n = 7 / Q8_0, rows 1 / 2 / 4 | n = 8 / Q8_0, rows 1 / 2 / 4 |
+|---|---|---|
+| step 2 | 1.42 / 1.04 / 1.10 | 1.46 / 1.10 / 1.18 |
+| + `__launch_bounds__(128)` | 1.43 / 1.07 / 1.10 | 1.47 / 1.12 / 1.18 (no effect, not kept) |
+| + non-temporal weight loads | 1.36 / 0.93 / 1.05 | 1.39 / 0.93 / 1.12 |
+
+With non-temporal loads the best rows per warp are 2 for n = 2, 7, 8 and 4 for n = 3..6 (n = 3: 0.875 vs 0.881,
+kept at 2). llama.cpp has no non-temporal loads elsewhere in `ggml-cuda` (grep), so this is a new, if small,
+pattern for them.
+
+Final patch (`bench/llama-cpp-fp8-mmvf-hip.patch`, 200 lines, ASCII), run `build/runs/20261115-134919/`:
+`test-backend-ops test -b ROCm0 -o MUL_MAT,MUL_MAT_FUSION -p f8_e4m3` passes; `perf`, 3 rounds, median us:
+
+| n | Q8_0 | F8 final | / Q8_0 |
+|---|---|---|---|
+| 1 | 337.9 | 312.3 | 0.92 |
+| 2 | 374.5 | 314.8 | 0.84 |
+| 3 | 383.9 | 335.3 | 0.87 |
+| 4 | 382.4 | 342.2 | 0.89 |
+| 5 | 386.1 | 341.8 | 0.89 |
+| 6 | 409.1 | 348.9 | 0.85 |
+| 7 | 442.1 | 414.1 | 0.94 |
+| 8 | 479.2 | 447.4 | 0.93 |
+
+Done criterion (decode within 3 % of Q8_0 at n = 1..8) is met in llama.cpp's own harness, with exact FP32
+activations and llama.cpp's NaN semantics. Spreads this run: 0.2-2.9 % (3 rounds).
+
+## Options for n >= 7 (superseded by step 3)
 
 1. Fewer instructions per product with exact results: tried as prototype variant C (widened weight converted to
    FP32 with v_cvt_f32_f16, exact, then plain FP32 FMAs that may dual-issue). The compiler pairs only a small share

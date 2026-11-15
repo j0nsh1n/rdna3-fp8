@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index 154a621fa..ee8657cec 100644
+index 154a621fa..52b6847b8 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
-@@ -13,6 +13,124 @@ static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t *
+@@ -13,6 +13,127 @@ static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t *
  #endif
  }
  
@@ -52,7 +52,10 @@ index 154a621fa..ee8657cec 100644
 +        uint4 tmpx[rows_per_warp];
 +#pragma unroll
 +        for (int r = 0; r < rows_per_warp; ++r) {
-+            tmpx[r] = ((const uint4 *) (x + min(row0 + r, nrows - 1)*stride_row))[c];
++            // weights are read once: keep them out of the cache so the activations stay in it
++            typedef uint32_t uint32x4_t __attribute__((ext_vector_type(4)));
++            const uint32x4_t v = __builtin_nontemporal_load((const uint32x4_t *) (x + min(row0 + r, nrows - 1)*stride_row) + c);
++            tmpx[r] = make_uint4(v.x, v.y, v.z, v.w);
 +        }
 +#pragma unroll
 +        for (int j = 0; j < ncols_dst; ++j) {
@@ -116,7 +119,7 @@ index 154a621fa..ee8657cec 100644
 +        case 4: LAUNCH_FP8_ROWS(4, 4); break;
 +        case 5: LAUNCH_FP8_ROWS(5, 4); break;
 +        case 6: LAUNCH_FP8_ROWS(6, 4); break;
-+        case 7: LAUNCH_FP8_ROWS(7, 4); break;
++        case 7: LAUNCH_FP8_ROWS(7, 2); break;
 +        case 8: LAUNCH_FP8_ROWS(8, 2); break;
 +    }
 +#undef LAUNCH_FP8_ROWS
@@ -127,7 +130,7 @@ index 154a621fa..ee8657cec 100644
  template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
  static __global__ void mul_mat_vec_f(
          const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-@@ -326,7 +444,47 @@ static __global__ void mul_mat_vec_f(
+@@ -326,7 +447,47 @@ static __global__ void mul_mat_vec_f(
  #endif
      } else if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
          const float2 * y2 = (const float2 *) y;
@@ -176,7 +179,7 @@ index 154a621fa..ee8657cec 100644
              const float2 tmpx = mmvf_load_fp8x2(x, col2);
              float2 tmpx_gate = {};
              if constexpr (has_fusion) {
-@@ -599,6 +757,18 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
+@@ -599,6 +760,18 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
          return;
      }
  
