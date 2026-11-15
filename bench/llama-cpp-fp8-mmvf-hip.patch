@@ -1,0 +1,82 @@
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 154a621fa..09d0e0795 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -13,6 +13,28 @@ static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t *
+ #endif
+ }
+ 
++#if defined(GGML_USE_HIP)
++// E4M3 bits shifted into FP16 position give the value * 2^-8 exactly (also for subnormals); the caller multiplies by 256.
++// Returns non-zero if a byte of x is a NaN code (0x7F or 0xFF).
++static __device__ __forceinline__ uint32_t mmvf_fma_fp8x16(float & sum, const uint4 x, const float4 * y) {
++    const uint32_t xw[4] = {x.x, x.y, x.z, x.w};
++    uint32_t nan_bytes = 0;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const uint32_t w    = xw[i];
++        const uint32_t even = ((w << 8) & 0x80008000u) | ((w << 7) & 0x3F803F80u);
++        const uint32_t odd  = (w & 0x80008000u) | ((w >> 1) & 0x3F803F80u);
++        nan_bytes |= ((w & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u;
++        const float4 yi = y[i];
++        sum = fmaf(__half2float(__ushort_as_half((unsigned short) (even & 0xFFFF))), yi.x, sum);
++        sum = fmaf(__half2float(__ushort_as_half((unsigned short) (odd  & 0xFFFF))), yi.y, sum);
++        sum = fmaf(__half2float(__ushort_as_half((unsigned short) (even >> 16))),    yi.z, sum);
++        sum = fmaf(__half2float(__ushort_as_half((unsigned short) (odd  >> 16))),    yi.w, sum);
++    }
++    return nan_bytes;
++}
++#endif // defined(GGML_USE_HIP)
++
+ template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+ static __global__ void mul_mat_vec_f(
+         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -326,7 +348,47 @@ static __global__ void mul_mat_vec_f(
+ #endif
+     } else if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
+         const float2 * y2 = (const float2 *) y;
+-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
++        int col2_start = tid;
++#if defined(GGML_USE_HIP)
++        // HIP has no FP8 conversion in hardware here: load 16 bytes at a time and widen with shifts.
++        const bool aligned16 = ncols2 % 8 == 0 && stride_col_y2 % 2 == 0 && (uintptr_t) x % 16 == 0 && (uintptr_t) y % 16 == 0 &&
++            (!use_gate || (uintptr_t) gate_x % 16 == 0);
++        if (aligned16) {
++            uint32_t nan_bytes = 0;
++            uint32_t nan_bytes_gate = 0;
++            for (int c = tid; c < ncols2/8; c += block_size) {
++                const uint4 tmpx = ((const uint4 *) x)[c];
++                uint4 tmpx_gate = {};
++                if constexpr (has_fusion) {
++                    if (use_gate) {
++                        tmpx_gate = ((const uint4 *) gate_x)[c];
++                    }
++                }
++#pragma unroll
++                for (int j = 0; j < ncols_dst; ++j) {
++                    const float4 * y4 = (const float4 *) (y2 + j*stride_col_y2) + 4*c;
++                    nan_bytes |= mmvf_fma_fp8x16(sumf[j], tmpx, y4);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            nan_bytes_gate |= mmvf_fma_fp8x16(sumf_gate[j], tmpx_gate, y4);
++                        }
++                    }
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++                sumf[j] = nan_bytes ? NAN : 256.0f*sumf[j];
++                if constexpr (has_fusion) {
++                    if (use_gate) {
++                        sumf_gate[j] = nan_bytes_gate ? NAN : 256.0f*sumf_gate[j];
++                    }
++                }
++            }
++            col2_start = ncols2;
++            GGML_UNUSED(nan_bytes_gate);
++        }
++#endif // defined(GGML_USE_HIP)
++        for (int col2 = col2_start; col2 < ncols2; col2 += block_size) {
+             const float2 tmpx = mmvf_load_fp8x2(x, col2);
+             float2 tmpx_gate = {};
+             if constexpr (has_fusion) {

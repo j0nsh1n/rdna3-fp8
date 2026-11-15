@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # GPU runs for the FP8 prototypes on the RX 7900 XT, following notes/test-plan.md.
-# Usage: bench/run-gpu.sh [phase ...]   phases: build correct baseline decode prefill (default: all, in that order)
+# Usage: bench/run-gpu.sh [phase ...]   phases: build correct baseline decode prefill llama
+# (default: build correct baseline decode prefill). llama times the patched llama.cpp FP8 decode against Q8_0.
 # Logs go to build/runs/<timestamp>/, one file per phase plus summary.txt.
 #
 # Every timed command takes the shared GPU lock on its own, so the WrongGPU project's runs get turns between ours.
@@ -142,6 +143,15 @@ phase_prefill() {
     done
     tbo "$log" 'f16|q8_0|f8_e4m3' '(64|128|256|512|1024|2048|4096)'
     echo "prefill: done" | tee -a "$SUMMARY"
+}
+
+phase_llama() {
+    local log="$OUT/llama.log"
+    untimed "$log" "$TBO" test -b ROCm0 -o MUL_MAT,MUL_MAT_FUSION -p 'f8_e4m3'
+    for round in 1 2 3; do
+        tbo "$log" 'q8_0|f8_e4m3|f16' '[1-8]'
+    done
+    echo "llama: done" | tee -a "$SUMMARY"
 }
 
 phases=("$@")
