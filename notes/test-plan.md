@@ -20,8 +20,11 @@ In `test_mul_mat(type_a, type_b, m, n, k)` the weight rows are `m` and the share
 - A1-A3 are done by `proto/widen_check.cpp`: the shift widening equals `ggml_get_type_traits(GGML_TYPE_F8_E4M3)->to_float`
   for all 254 non-NaN codes in every byte position of all 2^32 words. Mutation shown red (odd-lane mask 0x7F807F80:
   4261412864 bad bytes). The 256-code table alone did not catch that mutation; keep the word sweep.
-- E1, decided by the owner: decode AND prefill, "match Q8_0 within a few percent at every batch size". The working
-  number is 3 % on median time (the draft's proposal), pending the owner's confirmation.
+- E1, decided by the owner (2026-11-15, second answer supersedes the first):
+  - Done criterion: DECODE only, n = 1..8, our median time <= Q8_0 median time x 1.03 at every n.
+  - Condition: first take 10 repeats of the Q8_0 baseline at each n. If run-to-run spread is above about 3 %, judge
+    by "gap larger than the measured spread" or widen the gate to 5 %, and say which.
+  - Prefill (n = 64..4096) is a second goal, not part of done.
 - E2: per-tensor scale is applied in the epilogue (folded with the 2^8 from the widening). Per-row / block scales are
   out of scope for the prototype.
 - E3: the prototypes reject ragged shapes (decode K % 16; prefill M % 128, K % 32; prefill N is padded). Ragged K and
@@ -31,8 +34,25 @@ In `test_mul_mat(type_a, type_b, m, n, k)` the weight rows are `m` and the share
   `mmvq.cu:315-420`) and MMQ for n > 8 (`mmq.cu` `ggml_cuda_should_use_mmq`, RDNA3 branch: default true for Q8_0).
 - B1: prototype inputs are random bytes over all non-NaN codes (full +/-448 range) and N(0,1) activations; add the
   llama.cpp-style uniform [-1, 1] data for G3 comparisons.
-- Still open for the owner: E4 (F16 activations acceptable if variant B wins?) and E10 / NaN policy (0x7F/0xFF give
-  NaN as llama.cpp does, at extra cost, or +/-480 as the shift gives).
+- E10 / NaN, decided by the owner: NaN codes give NaN, as llama.cpp does (needed for an upstream offer; +/-480 would
+  hide a corrupt checkpoint). Implemented as a per-word check `((x & 0x7F7F7F7F) + 0x01010101) & 0x80808080`
+  ORed into a per-row flag; a flagged row is written as NaN in every column, which equals llama.cpp's result because
+  NaN times any activation is NaN. No branch in the loop. Exact over all 2^32 words (`proto/widen_check.cpp`;
+  mutant with +0x01010100 fails on 32774128 words). Cost from the generated code: about +0.6 to +0.8 VALU per weight
+  in decode, +11 VALU per 32-K step in prefill. Must be confirmed on the card (C: compare with and without the check).
+  Tests: `fp8_gemv ... nan` and `fp8_gemm ... nan` plant 0x7F in row 5 and 0xFF in the last row and fail unless
+  exactly those rows are NaN in every column.
+- E4, decided by the owner: FP16 activations (variant B) are acceptable only if B wins on speed, and then:
+  - variant A stays as the exact path to compare against; B is presented as a faster option, not as identical to
+    llama.cpp's FP8 path (which keeps F32 activations);
+  - overflow guard: the conversion pass flags any finite |a| >= 65520 and the kernel then runs A's loop on the F32
+    activations (decided on the GPU, no host round trip). Test: `fp8_gemv b ... ovf` plants 1e5 in column 0; it must
+    report the fallback and A-level NMSE. Also run the wide-range data (activations x 2^12) from B1.
+  - For reference (READ): llama.cpp's Q8_0 decode quantizes activations to Q8_1 before its dot products
+    (`mmvq.cu:1554` `quantize_row_q8_1_cuda`, `vec_dot_q8_0_q8_1` at `mmvq.cu:44`), coarser than FP16.
+- Instruction counts after the NaN check (loop VALU per weight, R = 2; budget about 18 at the read ceiling, from the
+  measured full-rate issue in `carry-over/measurements/shader-throughput.md`): A 3.7 (n=1), 6.9 (n=4), 11.1 (n=8);
+  B 3.1, 4.0, 6.0. `v_dot2_f32_f16` issue rate on this card is not measured (UNKNOWN).
 
 ## A. Correctness tests that need no GPU
 

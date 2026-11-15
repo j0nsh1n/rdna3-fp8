@@ -1,8 +1,10 @@
-"""Count instructions in each kernel's innermost backward-branch loop in an AMDGPU .s file.
+"""Count instructions in every math loop of each kernel in an AMDGPU .s file.
 
 Usage: python3 loop_isa.py <file.s> [kernel-name-regex]
-Prints, per kernel: loop length, VALU / SALU / memory / LDS counts, per-weight VALU (from the R template argument,
-16 weights per row per lane per iteration), and the opcode histogram.
+A math loop is a backward-branch loop containing v_fma_mix_f32, v_dot2*_f32_f16 or v_wmma. A kernel can hold several
+(variant B carries variant A's loop as its overflow fallback), so each is printed, tagged by its multiply instruction.
+Per loop: VALU / SALU / memory / LDS counts, per-weight VALU (from the R template argument, 16 weights per row per lane
+per iteration), and the opcode histogram.
 """
 import collections
 import re
@@ -32,20 +34,43 @@ def kernels(lines):
             body.append(ln)
 
 
-def innermost_loop(body):
+MATH = ("v_fma_mix_f32", "v_dot2", "v_dual_dot2", "v_wmma")
+
+
+def ops_in(body, start, end):
+    ops = []
+    for ln in body[start:end + 1]:
+        t = ln.strip()
+        if not t or t.startswith((";", ".")) or t.endswith(":"):
+            continue
+        ops.append(t.split()[0])
+    return ops
+
+
+def math_loops(body):
     labels = {}
     for i, ln in enumerate(body):
         m = re.match(r"^(\.LBB\S+):", ln)
         if m:
             labels[m.group(1)] = i
-    best = None
+    loops = []
     for i, ln in enumerate(body):
         m = re.match(r"^\s*s_cbranch_\w+\s+(\.LBB\S+)", ln) or re.match(r"^\s*s_branch\s+(\.LBB\S+)", ln)
         if m and m.group(1) in labels and labels[m.group(1)] < i:
-            start = labels[m.group(1)]
-            if best is None or (i - start) > (best[1] - best[0]):
-                best = (start, i)
-    return best
+            ops = ops_in(body, labels[m.group(1)], i)
+            if any(o.startswith(MATH) for o in ops):
+                loops.append(ops)
+    # A backward branch can span several loops (layout); keep only loops that contain no other math loop.
+    keep = []
+    for ops in loops:
+        if not any(o is not ops and len(o) < len(ops) and set(o) <= set(ops) and _contains(ops, o) for o in loops):
+            keep.append(ops)
+    return keep
+
+
+def _contains(big, small):
+    n = len(small)
+    return any(big[i:i + n] == small for i in range(len(big) - n + 1))
 
 
 def classify(op):
@@ -72,26 +97,22 @@ def main():
         name = names[mangled]
         if pat and not pat.search(name):
             continue
-        loop = innermost_loop(body)
-        if not loop:
-            print(f"{name}: no loop")
+        loops = math_loops(body)
+        if not loops:
+            print(f"{name}: no math loop")
             continue
-        ops = []
-        for ln in body[loop[0]:loop[1] + 1]:
-            t = ln.strip()
-            if not t or t.startswith((";", ".")) or t.endswith(":"):
-                continue
-            ops.append(t.split()[0])
-        cls = collections.Counter(classify(o) for o in ops)
         m = re.search(r"<(\d+), (\d+)>", name)
-        n, r = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
-        weights = 16 * r if r else 0
-        hist = collections.Counter(o for o in ops if classify(o) == "valu")
-        per_w = f"{cls['valu'] / weights:.2f} VALU/weight" if weights else ""
-        print(f"{name}\n  loop {len(ops)} instr: valu {cls['valu']} salu {cls['salu']} vmem {cls['vmem']} "
-              f"lds {cls['lds']} wait {cls['wait']}  {per_w}")
-        print("  " + ", ".join(f"{k} {v}" for k, v in hist.most_common()))
-
+        r = int(m.group(2)) if m else 0
+        weights = 16 * r
+        print(name)
+        for ops in loops:
+            cls = collections.Counter(classify(o) for o in ops)
+            hist = collections.Counter(o for o in ops if classify(o) == "valu")
+            kind = next((k for k in MATH if any(o.startswith(k) for o in ops)), "?")
+            per_w = f"{cls['valu'] / weights:.2f} VALU/weight" if weights else ""
+            print(f"  [{kind}] loop {len(ops)} instr: valu {cls['valu']} salu {cls['salu']} vmem {cls['vmem']} "
+                  f"lds {cls['lds']} wait {cls['wait']}  {per_w}")
+            print("    " + ", ".join(f"{k} {v}" for k, v in hist.most_common()))
 
 if __name__ == "__main__":
     main()

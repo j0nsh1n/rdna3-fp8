@@ -8,7 +8,10 @@
 // The WMMA output layout used in the store (element i of lane t -> row 2i + t/16 of A, column t%16 of B) is from
 // AMD's RDNA 3 WMMA guide, not yet checked on this card; the CPU comparison below checks it.
 //
-// Usage: fp8_gemm <N> [M K reps]
+// NaN codes (0x7F, 0xFF) make the whole output row NaN, as in llama.cpp: a per-word check while staging.
+//
+// Usage: fp8_gemm <N> [M K reps nan]; "nan" plants 0x7F in row 5 and 0xFF in the last row, which must be NaN in
+// every column while no other output is.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -53,6 +56,11 @@ __device__ __forceinline__ uint32_t widen_odd(uint32_t x) {
     return (x & 0x80008000u) | ((x >> 1) & 0x3F803F80u);
 }
 
+// Non-zero exactly when some byte is a NaN code (checked over all 2^32 words by proto/widen_check.cpp).
+__device__ __forceinline__ uint32_t nan_bytes(uint32_t x) {
+    return ((x & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u;
+}
+
 __global__ void act_to_f16_pairs(const float * __restrict__ y, uint32_t * __restrict__ yh, size_t words) {
     const size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x;
     if (i >= words) {
@@ -72,6 +80,7 @@ __global__ __launch_bounds__(THREADS) void gemm_fp8(const uint8_t * __restrict__
                                                    float * __restrict__ dst, int M, int N, int K, float out_scale) {
     __shared__ uint32_t sa[BM * LDS_STRIDE / 2];
     __shared__ uint32_t sb[BN * LDS_STRIDE / 2];
+    __shared__ uint32_t row_nan[BM];
 
     const int m0 = blockIdx.x * BM;
     const int n0 = blockIdx.y * BN;
@@ -81,6 +90,7 @@ __global__ __launch_bounds__(THREADS) void gemm_fp8(const uint8_t * __restrict__
     const int wn0 = (wave % 4) * WN;  // 4 waves along N
 
     float8_t acc[TM][TN] = {};
+    uint32_t nanf = 0;  // this thread always stages the same weight row, so one flag covers its share of that row
 
     // Staging: A is 128 rows x 32 bytes = 256 x 16 bytes, one chunk per thread.
     //          B is 128 rows x 32 halves = 256 x 32 bytes, two 16-byte chunks per thread.
@@ -95,6 +105,7 @@ __global__ __launch_bounds__(THREADS) void gemm_fp8(const uint8_t * __restrict__
 
         uint32_t * ad = sa + (a_row * LDS_STRIDE + a_half * 16) / 2;
         const uint32_t ws[4] = {wv.x, wv.y, wv.z, wv.w};
+        nanf |= nan_bytes(ws[0]) | nan_bytes(ws[1]) | nan_bytes(ws[2]) | nan_bytes(ws[3]);
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
             ad[2 * q] = widen_even(ws[q]);
@@ -127,6 +138,13 @@ __global__ __launch_bounds__(THREADS) void gemm_fp8(const uint8_t * __restrict__
         __syncthreads();
     }
 
+    // The two threads staging a row are adjacent lanes of one wave (a_half = tid % 2).
+    nanf |= __shfl_xor(nanf, 1, 32);
+    if (a_half == 0) {
+        row_nan[a_row] = nanf;
+    }
+    __syncthreads();
+
 #pragma unroll
     for (int i = 0; i < TM; ++i) {
 #pragma unroll
@@ -134,9 +152,10 @@ __global__ __launch_bounds__(THREADS) void gemm_fp8(const uint8_t * __restrict__
             const int n = n0 + wn0 + j * 16 + lane % 16;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                const int m = m0 + wm0 + i * 16 + 2 * e + lane / 16;
+                const int ml = wm0 + i * 16 + 2 * e + lane / 16;
+                const int m = m0 + ml;
                 if (n < N) {
-                    dst[(size_t) n * M + m] = acc[i][j][e] * out_scale;
+                    dst[(size_t) n * M + m] = row_nan[ml] ? NAN : acc[i][j][e] * out_scale;
                 }
             }
         }
@@ -169,6 +188,7 @@ int main(int argc, char ** argv) {
     const int M = argc > 2 ? std::atoi(argv[2]) : 16384;
     const int K = argc > 3 ? std::atoi(argv[3]) : 14336;
     const int reps = argc > 4 ? std::atoi(argv[4]) : 50;
+    const bool nan_mode = argc > 5 && std::strcmp(argv[5], "nan") == 0;
     if (M % BM != 0 || K % BK != 0 || N < 1) {
         std::fprintf(stderr, "need M %% %d == 0, K %% %d == 0, N >= 1\n", BM, BK);
         return 2;
@@ -183,6 +203,10 @@ int main(int argc, char ** argv) {
         do {
             b = (uint8_t) rng();
         } while ((b & 0x7F) == 0x7F);
+    }
+    if (nan_mode) {
+        hw[(size_t) 5 * K + 77] = 0x7F;
+        hw[(size_t) (M - 1) * K + K - 1] = 0xFF;
     }
     std::vector<float> hy((size_t) Np * K, 0.0f);
     std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -215,6 +239,18 @@ int main(int argc, char ** argv) {
     for (int c = 0; c < 256; ++c) {
         lut[c] = e4m3_to_float((uint8_t) c);
     }
+    long nan_missing = 0, nan_unexpected = 0;
+    for (int n = 0; n < N; ++n) {
+        for (int m = 0; m < M; ++m) {
+            const bool want = nan_mode && (m == 5 || m == M - 1);
+            const bool is = std::isnan(got[(size_t) n * M + m]);
+            nan_missing += want && !is;
+            nan_unexpected += !want && is;
+        }
+    }
+    std::printf("NaN outputs: missing %ld, unexpected %ld (%s)\n", nan_missing, nan_unexpected,
+                nan_mode ? "rows 5 and M-1 planted" : "none planted");
+
     double err2 = 0, ref2 = 0, max_rel = 0;
     std::uniform_int_distribution<int> pm(0, M - 1), pn(0, N - 1);
     const int samples = 4096;
@@ -222,6 +258,9 @@ int main(int argc, char ** argv) {
         // First outputs of every tile row and column exhaustively in the first 256, then random ones.
         const int m = s < 256 ? s % M : pm(rng);
         const int n = s < 256 ? (s / 16) % N : pn(rng);
+        if (nan_mode && (m == 5 || m == M - 1)) {
+            continue;
+        }
         double ref = 0, mag = 0;
         for (int k = 0; k < K; ++k) {
             const double p = (double) lut[hw[(size_t) m * K + k]] * (double) (_Float16) hy[(size_t) n * K + k];
@@ -258,5 +297,5 @@ int main(int argc, char ** argv) {
     const double med = ms[ms.size() / 2];
     std::printf("median %.1f us (min %.1f, p90 %.1f), %.2f TFLOPS (2*M*N*K)\n", med * 1e3, ms.front() * 1e3,
                 ms[ms.size() * 9 / 10] * 1e3, 2.0 * M * N * (double) K / (med * 1e9));
-    return 0;
+    return nan_missing == 0 && nan_unexpected == 0 ? 0 : 1;
 }

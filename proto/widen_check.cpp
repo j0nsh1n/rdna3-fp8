@@ -1,7 +1,7 @@
 // CPU check of the in-register FP8 E4M3 -> FP16 widening planned for the GPU kernels.
 // One 32-bit word holds weights b0..b3 (b0 lowest). Two half2 come out:
 //   even = (b0, b2), odd = (b1, b3), each FP16 equal to the E4M3 value times 2^-8.
-// Compared with llama.cpp's own CPU conversion for every possible word.
+// Compared with llama.cpp's own CPU conversion for every possible word, plus the per-word NaN-code check.
 #include "ggml.h"
 
 #include <cmath>
@@ -15,6 +15,11 @@ static uint32_t widen_even(uint32_t x) {
 
 static uint32_t widen_odd(uint32_t x) {
     return (x & 0x80008000u) | ((x >> 1) & 0x3F803F80u);
+}
+
+// Non-zero exactly when some byte of x is an E4M3 NaN code (low seven bits all ones: 0x7F or 0xFF).
+static uint32_t nan_bytes(uint32_t x) {
+    return ((x & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u;
 }
 
 static float half_bits_to_float(uint16_t h) {
@@ -50,11 +55,18 @@ int main() {
     std::printf("single codes: %d mismatches, %d NaN codes\n", bad_codes, nan_codes);
 
     // Every 32-bit word: catches one byte leaking into its neighbour's half.
-    uint64_t bad_words = 0;
+    uint64_t bad_words = 0, bad_nan = 0;
     for (uint64_t xx = 0; xx <= 0xFFFFFFFFull; ++xx) {
         const uint32_t x = (uint32_t) xx;
         const uint32_t e = widen_even(x), o = widen_odd(x);
         const uint16_t h[4] = {(uint16_t) e, (uint16_t) o, (uint16_t) (e >> 16), (uint16_t) (o >> 16)};
+        bool any_nan = false;
+        for (int i = 0; i < 4; ++i) {
+            any_nan |= ((x >> (8 * i)) & 0x7F) == 0x7F;
+        }
+        if ((nan_bytes(x) != 0) != any_nan && ++bad_nan <= 5) {
+            std::printf("NAN-CHECK MISMATCH word 0x%08X: expected %d\n", x, (int) any_nan);
+        }
         for (int i = 0; i < 4; ++i) {
             const uint8_t b = (uint8_t) (x >> (8 * i));
             if ((b & 0x7F) == 0x7F) {
@@ -68,6 +80,7 @@ int main() {
             }
         }
     }
-    std::printf("all 2^32 words: %llu mismatching bytes (NaN codes skipped)\n", (unsigned long long) bad_words);
-    return bad_codes == 0 && bad_words == 0 ? 0 : 1;
+    std::printf("all 2^32 words: %llu mismatching bytes (NaN codes skipped), %llu NaN-check mismatches\n",
+                (unsigned long long) bad_words, (unsigned long long) bad_nan);
+    return bad_codes == 0 && bad_words == 0 && bad_nan == 0 ? 0 : 1;
 }
