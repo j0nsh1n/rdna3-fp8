@@ -10,7 +10,7 @@
 //
 // NaN codes (0x7F, 0xFF) make the whole output row NaN, as in llama.cpp: a per-word check while staging.
 //
-// Usage: fp8_gemm <N> [M K reps nan]; "nan" plants 0x7F in row 5 and 0xFF in the last row, which must be NaN in
+// Usage: fp8_gemm <N> [M K reps plain|nan v1|v2]; "nan" plants 0x7F in row 5 and 0xFF in the last row, which must be NaN in
 // every column while no other output is.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -162,6 +162,106 @@ __global__ __launch_bounds__(THREADS) void gemm_fp8(const uint8_t * __restrict__
     }
 }
 
+// Version 2: the next K tile is fetched from global memory into registers while the current one is computed, and LDS
+// is double-buffered, so there is one barrier per K step and global latency overlaps the WMMA work.
+__global__ __launch_bounds__(THREADS) void gemm_fp8_v2(const uint8_t * __restrict__ w, const uint32_t * __restrict__ yh,
+                                                      float * __restrict__ dst, int M, int N, int K, float out_scale) {
+    __shared__ uint32_t sa[2][BM * LDS_STRIDE / 2];
+    __shared__ uint32_t sb[2][BN * LDS_STRIDE / 2];
+    __shared__ uint32_t row_nan[BM];
+
+    const int m0 = blockIdx.x * BM;
+    const int n0 = blockIdx.y * BN;
+    const int tid = threadIdx.x;
+    const int wave = tid / 32, lane = tid % 32;
+    const int wm0 = (wave / 4) * WM;
+    const int wn0 = (wave % 4) * WN;
+    const int a_row = tid / 2, a_half = tid % 2;
+    const int b_row = tid / 2, b_half = tid % 2;
+
+    const uint8_t * wp = w + (size_t) (m0 + a_row) * K + a_half * 16;
+    const uint32_t * yq = yh + ((size_t) (n0 + b_row) * K + b_half * 16) / 2;
+
+    float8_t acc[TM][TN] = {};
+    uint32_t nanf = 0;
+
+    u32x4 wv = __builtin_nontemporal_load(reinterpret_cast<const u32x4 *>(wp));
+    uint4 y0 = reinterpret_cast<const uint4 *>(yq)[0], y1 = reinterpret_cast<const uint4 *>(yq)[1];
+
+    auto stage = [&](int buf) {
+        uint32_t * ad = sa[buf] + (a_row * LDS_STRIDE + a_half * 16) / 2;
+        const uint32_t ws[4] = {wv.x, wv.y, wv.z, wv.w};
+        nanf |= nan_bytes(ws[0]) | nan_bytes(ws[1]) | nan_bytes(ws[2]) | nan_bytes(ws[3]);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            ad[2 * q] = widen_even(ws[q]);
+            ad[2 * q + 1] = widen_odd(ws[q]);
+        }
+        uint4 * bd = reinterpret_cast<uint4 *>(sb[buf] + (b_row * LDS_STRIDE + b_half * 16) / 2);
+        bd[0] = y0;
+        bd[1] = y1;
+    };
+
+    stage(0);
+    __syncthreads();
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const bool more = k0 + BK < K;
+        if (more) {
+            wv = __builtin_nontemporal_load(reinterpret_cast<const u32x4 *>(wp + k0 + BK));
+            const uint4 * yp = reinterpret_cast<const uint4 *>(yq + (k0 + BK) / 2);
+            y0 = yp[0];
+            y1 = yp[1];
+        }
+#pragma unroll
+        for (int kk = 0; kk < BK; kk += 16) {
+            half16_t af[TM], bf[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                af[i] = lds_frag(sa[buf] + ((wm0 + i * 16 + lane % 16) * LDS_STRIDE + kk) / 2);
+            }
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                bf[j] = lds_frag(sb[buf] + ((wn0 + j * 16 + lane % 16) * LDS_STRIDE + kk) / 2);
+            }
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf[j], acc[i][j]);
+                }
+            }
+        }
+        if (more) {
+            stage(buf ^ 1);
+        }
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    nanf |= __shfl_xor(nanf, 1, 32);
+    if (a_half == 0) {
+        row_nan[a_row] = nanf;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int n = n0 + wn0 + j * 16 + lane % 16;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int ml = wm0 + i * 16 + 2 * e + lane / 16;
+                const int m = m0 + ml;
+                if (n < N) {
+                    dst[(size_t) n * M + m] = row_nan[ml] ? NAN : acc[i][j][e] * out_scale;
+                }
+            }
+        }
+    }
+}
+
 static float e4m3_to_float(uint8_t x) {
     const int ax = x & 0x7F;
     const int e = ax >> 3, m = ax & 7;
@@ -189,6 +289,7 @@ int main(int argc, char ** argv) {
     const int K = argc > 3 ? std::atoi(argv[3]) : 14336;
     const int reps = argc > 4 ? std::atoi(argv[4]) : 50;
     const bool nan_mode = argc > 5 && std::strcmp(argv[5], "nan") == 0;
+    const bool use_v2 = argc > 6 && std::strcmp(argv[6], "v2") == 0;
     if (M % BM != 0 || K % BK != 0 || N < 1) {
         std::fprintf(stderr, "need M %% %d == 0, K %% %d == 0, N >= 1\n", BM, BK);
         return 2;
@@ -227,7 +328,11 @@ int main(int argc, char ** argv) {
     const size_t words = (size_t) Np * K / 4;
     auto run = [&] {
         act_to_f16_pairs<<<(words + 255) / 256, 256>>>(dy, dyh, words);
-        gemm_fp8<<<dim3(M / BM, Np / BN), THREADS>>>(dw, dyh, dd, M, N, K, out_scale);
+        if (use_v2) {
+            gemm_fp8_v2<<<dim3(M / BM, Np / BN), THREADS>>>(dw, dyh, dd, M, N, K, out_scale);
+        } else {
+            gemm_fp8<<<dim3(M / BM, Np / BN), THREADS>>>(dw, dyh, dd, M, N, K, out_scale);
+        }
     };
     run();
     CHECK(hipDeviceSynchronize());

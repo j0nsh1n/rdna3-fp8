@@ -79,9 +79,24 @@ rows per warp for 2-7 columns and 2 for 8, chosen by a rows x ksplit sweep in th
 (`build/runs/sweep-batched-*.log`) and checked on the 16384 x 14336 weight, where FP8 is now 0.91-0.97x Q8_0's time
 at every n = 1..8 (run build/runs/20261115-145158).
 
+## Prompt processing: can a dedicated FP8 kernel close the gap? (not yet)
+
+Prototype v2 (`proto/gemm/fp8_gemm.hip`, argument `v2`): register prefetch of the next K tile and double-buffered LDS,
+one barrier per K step. Correct (NMSE 1.2e-10 vs an FP16-activation reference, NaN rows exact). Timed in the
+prototype harness, N = 512 (TFLOPS, v1 -> v2): 16384 x 14336 37.5 -> 42.5; 3B shapes 8192 x 3072 26.6 -> 29.7,
+3072 x 3072 27.4 -> 23.0, 1024 x 3072 13.6 -> 14.5, 3072 x 8192 38.4 -> 37.3. llama.cpp's F16 hipBLAS path, inferred
+from the F16 model's 7400 t/s prompt speed, runs these at roughly 45-50 TFLOPS or more, so replacing
+conversion + hipBLAS with this kernel would make prompts slower. Small layers are the main problem: 1024 x 3072 at
+N = 512 gives only 32 tiles of 128 x 128 for 84 compute units. Matching rocBLAS here needs per-shape tile choices and
+split-K, a larger project with uncertain payoff.
+
+Larger prompt chunks reduce the conversion share (pp2048, t/s, 2 rounds x 3): FP8 6092-6126 at -ub 512 and
+6968-6984 at -ub 2048; Q8_0 6951-6968 and 7628-7639. FP8 is 12 % behind at 512-token chunks, 9 % at 2048. The rest of
+the gap is the F16 hipBLAS path itself being a few percent slower than Q8_0's MMQ kernel on this card (the F16 model
+shows the same).
+
 ## Open
 
 - Eight parallel sequences: 10 % behind Q8_0 in this model (ahead on the big weight).
-- Prompt processing: 13 % behind Q8_0 because every 512-token batch converts the weights again; a dedicated FP8
-  prompt kernel (prototype at 72 % of Q8_0 on the big weight) would remove the conversion.
+- Prompt processing: 9-13 % behind Q8_0 (conversion per chunk plus the F16 hipBLAS path); see the section above.
 - Not yet done: an actual generation test with a real prompt (owner asked for it after the tuning).
