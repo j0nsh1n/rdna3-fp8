@@ -5,7 +5,7 @@
 // yh: N*K/2 uint32 scratch (variant b), ovf: one int scratch (variant b). Returns a hipError_t value.
 extern "C" int fp8_gemv_run(char variant, int R, int N, const void * w, const void * y, void * yh, void * ovf, void * dst,
                             int M, int K, float out_scale, void * stream) {
-    if (K % 16 != 0 || N < 1 || N > 8 || (variant != 'a' && variant != 'b')) {
+    if (K % 16 != 0 || N < 1 || N > 8 || (variant != 'a' && variant != 'b' && variant != 'c')) {
         return (int) hipErrorInvalidValue;
     }
     const Buffers b{(const uint8_t *) w, (const float *) y, (uint32_t *) yh, (int *) ovf, (float *) dst};

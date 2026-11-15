@@ -1,7 +1,7 @@
 """Count instructions in every math loop of each kernel in an AMDGPU .s file.
 
 Usage: python3 loop_isa.py <file.s> [kernel-name-regex]
-A math loop is a backward-branch loop containing v_fma_mix_f32, v_dot2*_f32_f16 or v_wmma. A kernel can hold several
+A math loop is a backward-branch loop containing v_fma_mix_f32, v_dot2*_f32_f16, v_wmma or FP32 FMAs. A kernel can hold several
 (variant B carries variant A's loop as its overflow fallback), so each is printed, tagged by its multiply instruction.
 Per loop: VALU / SALU / memory / LDS counts, per-weight VALU (from the R template argument, 16 weights per row per lane
 per iteration), and the opcode histogram.
@@ -34,7 +34,7 @@ def kernels(lines):
             body.append(ln)
 
 
-MATH = ("v_fma_mix_f32", "v_dot2", "v_dual_dot2", "v_wmma")
+MATH = ("v_fma_mix_f32", "v_dot2", "v_dual_dot2", "v_wmma", "v_dual_fmac_f32", "v_fmac_f32", "v_fma_f32")
 
 
 def ops_in(body, start, end):

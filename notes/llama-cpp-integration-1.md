@@ -79,9 +79,12 @@ n = 4..7) and loads each activation chunk once for all its rows. NaN codes go th
 
 ## Options for n >= 7
 
-1. Fewer instructions per product with exact results: widen to FP32 and use dual-issue FP32 FMAs (v_dual_fmac_f32,
-   two per issue slot) instead of v_fma_mix_f32 (one per slot, never dual-issued). Needs an exact E4M3 -> FP32 path
-   including subnormals; untested.
+1. Fewer instructions per product with exact results: tried as prototype variant C (widened weight converted to
+   FP32 with v_cvt_f32_f16, exact, then plain FP32 FMAs that may dual-issue). The compiler pairs only a small share
+   into v_dual_fmac_f32 (VOPD needs operands in different register banks; HIP gives no control), so loop VALU per
+   weight barely moves (n = 8: 11.7 -> 10.4 at R = 1, none at R = 2, 4). Timed in the prototype harness, 2 rounds
+   (`build/runs/variant-c/ac-n78.log`): best C vs best A is 432 vs 441 us at n = 7 and 464 vs 478 us at n = 8
+   (2-3 %, within noise); C at R = 1 is 1.6-1.9x slower. Results identical to A (NMSE 4.5e-14). Not pursued.
 2. FP16 activations (variant B) for n >= 7 only: 5-6 VALU per weight; changes results slightly relative to
    llama.cpp's FP8 path (the owner allowed B only as a labelled faster option).
 3. Accept: exact path wins at n = 1..6, loses 7-13 % at n = 7, 8 (still 2.3-2.5x faster than unpatched FP8).

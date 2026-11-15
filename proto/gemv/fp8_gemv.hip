@@ -10,7 +10,9 @@
 // NaN codes (0x7F, 0xFF) make the whole output row NaN, as in llama.cpp: a per-word check ORed into a per-row flag.
 // R = rows per wave (activation reuse in registers). N = batch columns (1..8).
 //
-// Usage: fp8_gemv <a|b> <R 1|2|4> <N 1..8> [M K reps mode]; mode = plain | nan | ovf | time
+// Variant C: variant A with each weight converted to FP32 before the FMA (same results, dual-issue FMAs).
+//
+// Usage: fp8_gemv <a|b|c> <R 1|2|4> <N 1..8> [M K reps mode]; mode = plain | nan | ovf | time
 //   time: plain data, skips the CPU reference (for timed runs; correctness is checked separately).
 //   nan: plants 0x7F in row 5 and 0xFF in the last row; those rows must be NaN in every column, no others.
 //   ovf: plants an activation of 1e5 (above FP16's 65504) in column 0; variant B must fall back and stay exact.
@@ -98,7 +100,9 @@ __device__ __forceinline__ void wave_reduce_store(float (&acc)[N][R], uint32_t (
 }
 
 // Variant A loop: 16 weight bytes per lane per step, FP32 activations.
-template <int N, int R>
+// CVT32 (variant C): convert each widened weight to FP32 first (exact), so the products are plain FP32 FMAs that can
+// dual-issue (v_dual_fmac_f32); the empty asm stops LLVM folding the conversion back into v_fma_mix_f32.
+template <int N, int R, bool CVT32 = false>
 __device__ __forceinline__ void gemv_a_body(const uint8_t * __restrict__ w, const float * __restrict__ y,
                                             float * __restrict__ dst, int M, int K, float out_scale) {
     const int wave = blockIdx.x * WAVES_PER_BLOCK + threadIdx.x / WAVE;
@@ -129,11 +133,15 @@ __device__ __forceinline__ void gemv_a_body(const uint8_t * __restrict__ w, cons
                     const uint32_t word = q == 0 ? wv[r].x : q == 1 ? wv[r].y : q == 2 ? wv[r].z : wv[r].w;
                     const uint32_t e = widen_even(word);
                     const uint32_t o = widen_odd(word);
+                    float w0 = lo_f(e), w1 = lo_f(o), w2 = hi_f(e), w3 = hi_f(o);
+                    if constexpr (CVT32) {
+                        asm("" : "+v"(w0), "+v"(w1), "+v"(w2), "+v"(w3));
+                    }
                     float s = acc[n][r];
-                    s = fmaf(lo_f(e), a.x, s);
-                    s = fmaf(lo_f(o), a.y, s);
-                    s = fmaf(hi_f(e), a.z, s);
-                    s = fmaf(hi_f(o), a.w, s);
+                    s = fmaf(w0, a.x, s);
+                    s = fmaf(w1, a.y, s);
+                    s = fmaf(w2, a.z, s);
+                    s = fmaf(w3, a.w, s);
                     acc[n][r] = s;
                 }
             }
@@ -146,6 +154,12 @@ template <int N, int R>
 __global__ __launch_bounds__(WAVE * WAVES_PER_BLOCK) void gemv_a(const uint8_t * __restrict__ w, const float * __restrict__ y,
                                                                 float * __restrict__ dst, int M, int K, float out_scale) {
     gemv_a_body<N, R>(w, y, dst, M, K, out_scale);
+}
+
+template <int N, int R>
+__global__ __launch_bounds__(WAVE * WAVES_PER_BLOCK) void gemv_c(const uint8_t * __restrict__ w, const float * __restrict__ y,
+                                                                float * __restrict__ dst, int M, int K, float out_scale) {
+    gemv_a_body<N, R, true>(w, y, dst, M, K, out_scale);
 }
 
 // Variant B pre-pass: F32 activations -> FP16, pairs reordered to match (b0,b2),(b1,b3) per weight word.
@@ -251,6 +265,8 @@ static void launch(char variant, const Buffers & b, int M, int K, float s, hipSt
     const int blocks = (waves + WAVES_PER_BLOCK - 1) / WAVES_PER_BLOCK;
     if (variant == 'a') {
         gemv_a<N, R><<<blocks, WAVE * WAVES_PER_BLOCK, 0, stream>>>(b.w, b.y, b.dst, M, K, s);
+    } else if (variant == 'c') {
+        gemv_c<N, R><<<blocks, WAVE * WAVES_PER_BLOCK, 0, stream>>>(b.w, b.y, b.dst, M, K, s);
     } else {
         const size_t words = (size_t) N * K / 4;
         CHECK(hipMemsetAsync(b.ovf, 0, sizeof(int), stream));
@@ -287,7 +303,7 @@ static void require_gfx1100() {
 int main(int argc, char ** argv) {
     require_gfx1100();
     if (argc < 4) {
-        std::fprintf(stderr, "usage: %s <a|b> <R 1|2|4> <N 1..8> [M K reps plain|nan|ovf|time]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <a|b|c> <R 1|2|4> <N 1..8> [M K reps plain|nan|ovf|time]\n", argv[0]);
         return 2;
     }
     const char variant = argv[1][0];
@@ -297,8 +313,8 @@ int main(int argc, char ** argv) {
     const int K = argc > 5 ? std::atoi(argv[5]) : 14336;
     const int reps = argc > 6 ? std::atoi(argv[6]) : 200;
     const std::string mode = argc > 7 ? argv[7] : "plain";
-    if (K % 16 != 0 || (variant != 'a' && variant != 'b') || M < 6 || (mode != "plain" && mode != "nan" && mode != "ovf" && mode != "time")) {
-        std::fprintf(stderr, "K must be a multiple of 16, M >= 6; variant a or b; mode plain, nan, ovf or time\n");
+    if (K % 16 != 0 || (variant != 'a' && variant != 'b' && variant != 'c') || M < 6 || (mode != "plain" && mode != "nan" && mode != "ovf" && mode != "time")) {
+        std::fprintf(stderr, "K must be a multiple of 16, M >= 6; variant a, b or c; mode plain, nan, ovf or time\n");
         return 2;
     }
     const float tensor_scale = 0.0123f;
