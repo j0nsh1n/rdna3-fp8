@@ -45,10 +45,43 @@ original loop.
   speed from 2-4 rows per wave sharing those loads (R = 1 in the prototype was also 1.3-1.4x Q8_0 at n >= 4).
   The jumps at n = 5 and 7 are not explained yet.
 
-## Options for n >= 4
+## Step 2: rows per warp for n = 2..8 (same patch file, updated)
 
-1. Rows per block in the FP8 path (a template parameter or a separate FP8 kernel in `mmvf.cu`): the prototype shows
-   Q8_0 parity is reachable. It is a structural change to a shared kernel, so llama.cpp's guidelines ask to pause and
-   discuss before writing it.
-2. FP16 activations (prototype variant B, 8-26 % faster than Q8_0): changes results relative to llama.cpp's FP8
-   path; a bigger discussion upstream.
+`mul_mat_vec_fp8_rows<ncols_dst, rows_per_warp>`: a separate FP8 kernel in `mmvf.cu` (HIP only), used for
+ncols_dst 2..8 without fusion or ids when shapes and pointers are 16-byte aligned (channels and samples supported);
+everything else keeps `mul_mat_vec_f`. Each warp does 2 or 4 rows (prototype's best: 2 for n = 2, 3, 8; 4 for
+n = 4..7) and loads each activation chunk once for all its rows. NaN codes go through the warp sum as NaN.
+
+- `test-backend-ops test -b ROCm0 -p f8_e4m3`: 450/450 OK. Mutation (scale 128 in the new kernel): 19 MUL_MAT cases
+  FAIL, covering every n from 2 to 8, so the kernel is exercised. Restored and rebuilt.
+- Generated code: no spills (53-112 VGPRs); loop VALU per weight 4.9 (n = 2) to 11.3 (n = 8), the same as the
+  prototype's variant A.
+- Timing, run `build/runs/20261115-131702/`, `test-backend-ops perf`, 3 rounds, median us:
+
+| n | Q8_0 | F8 rows | / Q8_0 | F8 step 1 | F16 |
+|---|---|---|---|---|---|
+| 1 | 366.3 | 321.7 | 0.88 | 339.1 | 679.2 |
+| 2 | 377.8 | 328.3 | 0.87 | 354.4 | 673.4 |
+| 3 | 378.1 | 346.9 | 0.92 | 394.9 | 714.1 |
+| 4 | 382.4 | 365.5 | 0.96 | 557.4 | 760.0 |
+| 5 | 395.4 | 372.7 | 0.94 | 887.8 | 765.6 |
+| 6 | 421.2 | 393.6 | 0.93 | 927.0 | 770.6 |
+| 7 | 448.1 | 505.6 | 1.13 | 1164.7 | 769.3 |
+| 8 | 482.8 | 515.3 | 1.07 | 1286.8 | 780.9 |
+
+(n = 1 uses the step 1 path; its change between runs is run-to-run variation, Q8_0's n = 1 spread is 8.3 %.)
+
+- n = 1..6 beat Q8_0 in llama.cpp's own harness. n = 7 and 8 miss the 3 % gate by 13 % and 7 %.
+- Explained: the code is the prototype's, so the prototype's parity at n = 7, 8 (450, 480 us) came from its own
+  timing harness, as flagged in prototype-results-1. The PyTorch harness also gives about 500 us there
+  (notes/pytorch-ext-1.md). At n >= 7 variant A is bound by its multiply instructions: one v_fma_mix_f32 per weight
+  per column plus about 2.5 per weight for widening and the NaN check (about 10-11 VALU per weight).
+
+## Options for n >= 7
+
+1. Fewer instructions per product with exact results: widen to FP32 and use dual-issue FP32 FMAs (v_dual_fmac_f32,
+   two per issue slot) instead of v_fma_mix_f32 (one per slot, never dual-issued). Needs an exact E4M3 -> FP32 path
+   including subnormals; untested.
+2. FP16 activations (variant B) for n >= 7 only: 5-6 VALU per weight; changes results slightly relative to
+   llama.cpp's FP8 path (the owner allowed B only as a labelled faster option).
+3. Accept: exact path wins at n = 1..6, loses 7-13 % at n = 7, 8 (still 2.3-2.5x faster than unpatched FP8).

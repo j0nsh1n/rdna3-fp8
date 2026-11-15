@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index 154a621fa..09d0e0795 100644
+index 154a621fa..ee8657cec 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
-@@ -13,6 +13,28 @@ static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t *
+@@ -13,6 +13,124 @@ static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t *
  #endif
  }
  
@@ -26,12 +26,108 @@ index 154a621fa..09d0e0795 100644
 +    }
 +    return nan_bytes;
 +}
++
++// FP8 rows for 2..8 columns: each warp does rows_per_warp rows, so one activation load serves several rows.
++template <int ncols_dst, int rows_per_warp>
++static __global__ void mul_mat_vec_fp8_rows(
++        const ggml_fp8_e4m3_t * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows,
++        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
++        const int channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
++        const int sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    const int lane = threadIdx.x % warp_size;
++    const int row0 = (blockIdx.x*(blockDim.x/warp_size) + threadIdx.x/warp_size) * rows_per_warp;
++    if (row0 >= nrows) {
++        return;
++    }
++    const int channel_dst = blockIdx.y;
++    const int sample_dst  = blockIdx.z;
++    x   += int64_t(sample_dst/sample_ratio)*stride_sample_x + int64_t(channel_dst/channel_ratio)*stride_channel_x;
++    y   += int64_t(sample_dst)*stride_sample_y + int64_t(channel_dst)*stride_channel_y;
++    dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
++
++    float sumf[ncols_dst][rows_per_warp] = {{0.0f}};
++    uint32_t nan_bytes[rows_per_warp] = {0};
++    for (int c = lane; c < ncols/16; c += warp_size) {
++        uint4 tmpx[rows_per_warp];
++#pragma unroll
++        for (int r = 0; r < rows_per_warp; ++r) {
++            tmpx[r] = ((const uint4 *) (x + min(row0 + r, nrows - 1)*stride_row))[c];
++        }
++#pragma unroll
++        for (int j = 0; j < ncols_dst; ++j) {
++            const float4 * y4 = (const float4 *) (y + j*stride_col_y) + 4*c;
++            const float4 tmpy[4] = {y4[0], y4[1], y4[2], y4[3]};
++#pragma unroll
++            for (int r = 0; r < rows_per_warp; ++r) {
++                nan_bytes[r] |= mmvf_fma_fp8x16(sumf[j][r], tmpx[r], tmpy);
++            }
++        }
++    }
++
++#pragma unroll
++    for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++        for (int r = 0; r < rows_per_warp; ++r) {
++            const float sum = warp_reduce_sum<warp_size>(nan_bytes[r] ? NAN : 256.0f*sumf[j][r]);
++            if (lane == 0 && row0 + r < nrows) {
++                dst[j*stride_col_dst + row0 + r] = sum;
++            }
++        }
++    }
++}
++
++template <int ncols_dst, int rows_per_warp>
++static void launch_mul_mat_vec_fp8_rows(
++        const ggml_fp8_e4m3_t * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
++        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
++        const int64_t nchannels_x, const int64_t nchannels_dst, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
++        const int64_t nsamples_x, const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
++        cudaStream_t stream) {
++    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
++    constexpr int nwarps = 4;
++    const int64_t rows_per_block = nwarps*rows_per_warp;
++    const dim3 block_nums((nrows + rows_per_block - 1)/rows_per_block, nchannels_dst, nsamples_dst);
++    const dim3 block_dims(nwarps*warp_size, 1, 1);
++    mul_mat_vec_fp8_rows<ncols_dst, rows_per_warp><<<block_nums, block_dims, 0, stream>>>(
++        x, y, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++        nchannels_dst/nchannels_x, stride_channel_x, stride_channel_y, stride_channel_dst,
++        nsamples_dst/nsamples_x, stride_sample_x, stride_sample_y, stride_sample_dst);
++}
++
++// Returns false if the shape or alignment does not fit; the caller then uses mul_mat_vec_f.
++static bool mul_mat_vec_fp8_rows_cuda(
++        const ggml_fp8_e4m3_t * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows, const int64_t ncols_dst,
++        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
++        const int64_t nchannels_x, const int64_t nchannels_dst, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
++        const int64_t nsamples_x, const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
++        cudaStream_t stream) {
++    const bool aligned = ncols % 16 == 0 && stride_row % 16 == 0 && stride_channel_x % 16 == 0 && stride_sample_x % 16 == 0 &&
++        stride_col_y % 4 == 0 && stride_channel_y % 4 == 0 && stride_sample_y % 4 == 0 &&
++        (uintptr_t) x % 16 == 0 && (uintptr_t) y % 16 == 0;
++    if (ncols_dst < 2 || ncols_dst > 8 || !aligned || nchannels_dst % nchannels_x != 0 || nsamples_dst % nsamples_x != 0) {
++        return false;
++    }
++#define LAUNCH_FP8_ROWS(ncd, rpw) launch_mul_mat_vec_fp8_rows<ncd, rpw>(x, y, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst, \
++        nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream)
++    switch (ncols_dst) {
++        case 2: LAUNCH_FP8_ROWS(2, 2); break;
++        case 3: LAUNCH_FP8_ROWS(3, 2); break;
++        case 4: LAUNCH_FP8_ROWS(4, 4); break;
++        case 5: LAUNCH_FP8_ROWS(5, 4); break;
++        case 6: LAUNCH_FP8_ROWS(6, 4); break;
++        case 7: LAUNCH_FP8_ROWS(7, 4); break;
++        case 8: LAUNCH_FP8_ROWS(8, 2); break;
++    }
++#undef LAUNCH_FP8_ROWS
++    return true;
++}
 +#endif // defined(GGML_USE_HIP)
 +
  template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
  static __global__ void mul_mat_vec_f(
          const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-@@ -326,7 +348,47 @@ static __global__ void mul_mat_vec_f(
+@@ -326,7 +444,47 @@ static __global__ void mul_mat_vec_f(
  #endif
      } else if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
          const float2 * y2 = (const float2 *) y;
@@ -80,3 +176,22 @@ index 154a621fa..09d0e0795 100644
              const float2 tmpx = mmvf_load_fp8x2(x, col2);
              float2 tmpx_gate = {};
              if constexpr (has_fusion) {
+@@ -599,6 +757,18 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
+         return;
+     }
+ 
++#if defined(GGML_USE_HIP)
++    if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
++        const bool has_fusion = fusion.x_bias || fusion.gate || fusion.gate_bias || fusion.x_scale || fusion.gate_scale ||
++            fusion.shared_up || fusion.shared_gate || fusion.shared_dst;
++        if (!has_fusion && mul_mat_vec_fp8_rows_cuda(x, y, dst, ncols, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst,
++                nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream)) {
++            return;
++        }
++    }
++#endif // defined(GGML_USE_HIP)
++
+     switch (ncols_dst) {
+         case 1:
+             launch_mul_mat_vec_f_cuda<T, type_acc, 1>

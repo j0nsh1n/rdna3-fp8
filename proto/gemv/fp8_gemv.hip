@@ -246,34 +246,35 @@ struct Buffers {
 };
 
 template <int N, int R>
-static void launch(char variant, const Buffers & b, int M, int K, float s) {
+static void launch(char variant, const Buffers & b, int M, int K, float s, hipStream_t stream = 0) {
     const int waves = (M + R - 1) / R;
     const int blocks = (waves + WAVES_PER_BLOCK - 1) / WAVES_PER_BLOCK;
     if (variant == 'a') {
-        gemv_a<N, R><<<blocks, WAVE * WAVES_PER_BLOCK>>>(b.w, b.y, b.dst, M, K, s);
+        gemv_a<N, R><<<blocks, WAVE * WAVES_PER_BLOCK, 0, stream>>>(b.w, b.y, b.dst, M, K, s);
     } else {
         const size_t words = (size_t) N * K / 4;
-        CHECK(hipMemsetAsync(b.ovf, 0, sizeof(int)));
-        act_to_f16_pairs<<<(words + 255) / 256, 256>>>(b.y, b.yh, words, b.ovf);
-        gemv_b<N, R><<<blocks, WAVE * WAVES_PER_BLOCK>>>(b.w, b.yh, b.y, b.ovf, b.dst, M, K, s);
+        CHECK(hipMemsetAsync(b.ovf, 0, sizeof(int), stream));
+        act_to_f16_pairs<<<(words + 255) / 256, 256, 0, stream>>>(b.y, b.yh, words, b.ovf);
+        gemv_b<N, R><<<blocks, WAVE * WAVES_PER_BLOCK, 0, stream>>>(b.w, b.yh, b.y, b.ovf, b.dst, M, K, s);
     }
 }
 
 template <int R>
-static void launch_n(int N, char v, const Buffers & b, int M, int K, float s) {
+static void launch_n(int N, char v, const Buffers & b, int M, int K, float s, hipStream_t st = 0) {
     switch (N) {
-        case 1: launch<1, R>(v, b, M, K, s); break;
-        case 2: launch<2, R>(v, b, M, K, s); break;
-        case 3: launch<3, R>(v, b, M, K, s); break;
-        case 4: launch<4, R>(v, b, M, K, s); break;
-        case 5: launch<5, R>(v, b, M, K, s); break;
-        case 6: launch<6, R>(v, b, M, K, s); break;
-        case 7: launch<7, R>(v, b, M, K, s); break;
-        case 8: launch<8, R>(v, b, M, K, s); break;
+        case 1: launch<1, R>(v, b, M, K, s, st); break;
+        case 2: launch<2, R>(v, b, M, K, s, st); break;
+        case 3: launch<3, R>(v, b, M, K, s, st); break;
+        case 4: launch<4, R>(v, b, M, K, s, st); break;
+        case 5: launch<5, R>(v, b, M, K, s, st); break;
+        case 6: launch<6, R>(v, b, M, K, s, st); break;
+        case 7: launch<7, R>(v, b, M, K, s, st); break;
+        case 8: launch<8, R>(v, b, M, K, s, st); break;
         default: std::fprintf(stderr, "N must be 1..8\n"); std::exit(2);
     }
 }
 
+#ifndef FP8_GEMV_NO_MAIN
 static void require_gfx1100() {
     hipDeviceProp_t prop;
     CHECK(hipGetDeviceProperties(&prop, 0));
@@ -413,3 +414,4 @@ int main(int argc, char ** argv) {
                 ms[ms.size() * 9 / 10] * 1e3, (double) M * K / (med * 1e3));
     return nan_missing == 0 && nan_unexpected == 0 ? 0 : 1;
 }
+#endif  // FP8_GEMV_NO_MAIN
