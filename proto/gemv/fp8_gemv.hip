@@ -222,7 +222,17 @@ static void launch_n(int N, char v, const uint8_t * w, const float * y, uint32_t
     }
 }
 
+static void require_gfx1100() {
+    hipDeviceProp_t prop;
+    CHECK(hipGetDeviceProperties(&prop, 0));
+    if (std::strncmp(prop.gcnArchName, "gfx1100", 7) != 0) {
+        std::fprintf(stderr, "device 0 is %s (%s), not the gfx1100 card; refusing to time the wrong GPU\n", prop.name, prop.gcnArchName);
+        std::exit(3);
+    }
+}
+
 int main(int argc, char ** argv) {
+    require_gfx1100();
     if (argc < 4) {
         std::fprintf(stderr, "usage: %s <a|b> <R 1|2|4> <N 1|2|4|8> [M K reps]\n", argv[0]);
         return 2;

@@ -150,7 +150,17 @@ static float e4m3_to_float(uint8_t x) {
     return x & 0x80 ? -v : v;
 }
 
+static void require_gfx1100() {
+    hipDeviceProp_t prop;
+    CHECK(hipGetDeviceProperties(&prop, 0));
+    if (std::strncmp(prop.gcnArchName, "gfx1100", 7) != 0) {
+        std::fprintf(stderr, "device 0 is %s (%s), not the gfx1100 card; refusing to time the wrong GPU\n", prop.name, prop.gcnArchName);
+        std::exit(3);
+    }
+}
+
 int main(int argc, char ** argv) {
+    require_gfx1100();
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s <N> [M K reps]\n", argv[0]);
         return 2;

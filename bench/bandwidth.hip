@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #define CHECK(x)                                                                              \
@@ -42,7 +43,17 @@ static void report(const char * name, std::vector<float> ms, double bytes) {
                 bytes / (1 << 20), med, bytes / (med * 1e6), best, bytes / (best * 1e6));
 }
 
+static void require_gfx1100() {
+    hipDeviceProp_t prop;
+    CHECK(hipGetDeviceProperties(&prop, 0));
+    if (std::strncmp(prop.gcnArchName, "gfx1100", 7) != 0) {
+        std::fprintf(stderr, "device 0 is %s (%s), not the gfx1100 card; refusing to time the wrong GPU\n", prop.name, prop.gcnArchName);
+        std::exit(3);
+    }
+}
+
 int main(int argc, char ** argv) {
+    require_gfx1100();
     const size_t bytes = (argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 1024ull) << 20;  // MiB per buffer
     const int reps = 50;
     const size_t n = bytes / sizeof(uint4);
