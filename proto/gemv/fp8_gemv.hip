@@ -10,7 +10,8 @@
 // NaN codes (0x7F, 0xFF) make the whole output row NaN, as in llama.cpp: a per-word check ORed into a per-row flag.
 // R = rows per wave (activation reuse in registers). N = batch columns (1..8).
 //
-// Usage: fp8_gemv <a|b> <R 1|2|4> <N 1..8> [M K reps mode]; mode = plain | nan | ovf
+// Usage: fp8_gemv <a|b> <R 1|2|4> <N 1..8> [M K reps mode]; mode = plain | nan | ovf | time
+//   time: plain data, skips the CPU reference (for timed runs; correctness is checked separately).
 //   nan: plants 0x7F in row 5 and 0xFF in the last row; those rows must be NaN in every column, no others.
 //   ovf: plants an activation of 1e5 (above FP16's 65504) in column 0; variant B must fall back and stay exact.
 #include <hip/hip_fp16.h>
@@ -285,7 +286,7 @@ static void require_gfx1100() {
 int main(int argc, char ** argv) {
     require_gfx1100();
     if (argc < 4) {
-        std::fprintf(stderr, "usage: %s <a|b> <R 1|2|4> <N 1..8> [M K reps plain|nan|ovf]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <a|b> <R 1|2|4> <N 1..8> [M K reps plain|nan|ovf|time]\n", argv[0]);
         return 2;
     }
     const char variant = argv[1][0];
@@ -295,8 +296,8 @@ int main(int argc, char ** argv) {
     const int K = argc > 5 ? std::atoi(argv[5]) : 14336;
     const int reps = argc > 6 ? std::atoi(argv[6]) : 200;
     const std::string mode = argc > 7 ? argv[7] : "plain";
-    if (K % 16 != 0 || (variant != 'a' && variant != 'b') || M < 6 || (mode != "plain" && mode != "nan" && mode != "ovf")) {
-        std::fprintf(stderr, "K must be a multiple of 16, M >= 6; variant a or b; mode plain, nan or ovf\n");
+    if (K % 16 != 0 || (variant != 'a' && variant != 'b') || M < 6 || (mode != "plain" && mode != "nan" && mode != "ovf" && mode != "time")) {
+        std::fprintf(stderr, "K must be a multiple of 16, M >= 6; variant a or b; mode plain, nan, ovf or time\n");
         return 2;
     }
     const float tensor_scale = 0.0123f;
@@ -358,7 +359,7 @@ int main(int argc, char ** argv) {
     for (int c = 0; c < 256; ++c) {
         lut[c] = e4m3_to_float((uint8_t) c);
     }
-    for (int n = 0; n < N; ++n) {
+    for (int n = 0; n < N && mode != "time"; ++n) {
         for (int m = 0; m < M; ++m) {
             double ref = 0, mag = 0;
             const uint8_t * wr = &hw[(size_t) m * K];
