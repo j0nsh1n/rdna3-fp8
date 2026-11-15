@@ -1,8 +1,93 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 540c53614..567207986 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1931,7 +1931,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     bool prefer_f32_output = false;
+     if (compute_type == GGML_TYPE_F16) {
+-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
++        // F8 weights are not scaled yet, so the dot products can exceed the F16 range
++        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc) ||
++            src0->type == GGML_TYPE_F8_E4M3;
+     } else if (compute_type == GGML_TYPE_BF16) {
+         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_RDNA4_M(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+     }
+@@ -2122,6 +2124,55 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+     }
+ }
+ 
++#if defined(GGML_USE_HIP)
++// E4M3 -> F16 with the per-tensor weight scale applied, so F16 GEMM does not overflow on unscaled values up to 448.
++static __global__ void convert_fp8_scaled_f16(const uint32_t * __restrict__ x, half * __restrict__ y, const float * __restrict__ scale, const int64_t n4) {
++    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= n4) {
++        return;
++    }
++    const uint32_t w = x[i];
++    const float s = 256.0f * *scale;
++    const uint32_t even = ((w << 8) & 0x80008000u) | ((w << 7) & 0x3F803F80u);
++    const uint32_t odd  = (w & 0x80008000u) | ((w >> 1) & 0x3F803F80u);
++    const uint16_t h[4] = {(uint16_t) even, (uint16_t) odd, (uint16_t) (even >> 16), (uint16_t) (odd >> 16)};
++    uint16_t out[4];
++#pragma unroll
++    for (int k = 0; k < 4; ++k) {
++        const bool is_nan = ((w >> (8*k)) & 0x7F) == 0x7F;
++        out[k] = __half_as_ushort(is_nan ? __float2half(NAN) : __float2half(__half2float(__ushort_as_half(h[k])) * s));
++    }
++    ((uint2 *) y)[i] = make_uint2(out[0] | ((uint32_t) out[1] << 16), out[2] | ((uint32_t) out[3] << 16));
++}
++
++// MUL_MAT of F8 weights fused with the MUL by their per-tensor scale, for more than MMVF_MAX_BATCH_SIZE columns.
++// Folds the scale into an F16 copy of the weights and runs the regular F16 cuBLAS path, writing to the MUL output.
++static bool ggml_cuda_mul_mat_fp8_scaled_f16(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const ggml_tensor * scale) {
++    if (src0->type != GGML_TYPE_F8_E4M3 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !scale ||
++            src1->ne[1] <= MMVF_MAX_BATCH_SIZE || !ggml_is_contiguous(src0) || !ggml_is_contiguous(dst) || src0->ne[0] % 16 != 0 ||
++            !ggml_cuda_is_aligned(src0, 4) || !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
++        return false;
++    }
++    const int64_t ne = ggml_nelements(src0);
++    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ne);
++    const int64_t n4 = ne/4;
++    convert_fp8_scaled_f16<<<(n4 + 255)/256, 256, 0, ctx.stream()>>>(
++        (const uint32_t *) src0->data, src0_f16.ptr, (const float *) scale->data, n4);
++    CUDA_CHECK(cudaGetLastError());
++
++    ggml_tensor src0_view = *src0;
++    src0_view.type  = GGML_TYPE_F16;
++    src0_view.data  = src0_f16.ptr;
++    src0_view.nb[0] = sizeof(half);
++    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
++        src0_view.nb[i] = src0_view.nb[i - 1]*src0_view.ne[i - 1];
++    }
++    ggml_cuda_mul_mat_cublas(ctx, &src0_view, src1, dst);
++    return true;
++}
++#endif // defined(GGML_USE_HIP)
++
+ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+                                           const ggml_tensor * ffn_gate,
+                                           const ggml_tensor * glu,
+@@ -5018,6 +5069,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                     ggml_cuda_mul_mat_fp8(*cuda_ctx, src0, src1, scale_node, scale)) {
+                 return 1;
+             }
++#if defined(GGML_USE_HIP)
++            if (op == GGML_OP_MUL_MAT && !with_bias && src0->type == GGML_TYPE_F8_E4M3 &&
++                    ggml_get_op_params_i32(mm_node, 3) != GGML_PREC_F32 &&
++                    ggml_cuda_mul_mat_fp8_scaled_f16(*cuda_ctx, src0, src1, scale_node, scale)) {
++                return 1;
++            }
++#endif // defined(GGML_USE_HIP)
+ 
+             if (!with_bias && src0->type == GGML_TYPE_NVFP4 && src1->type == GGML_TYPE_F32 && mm_node->type == GGML_TYPE_F32) {
+                 const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index 154a621fa..52b6847b8 100644
+index 154a621fa..3c7d5e1c2 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
-@@ -13,6 +13,127 @@ static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t *
+@@ -13,6 +13,149 @@ static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t *
  #endif
  }
  
@@ -28,18 +113,19 @@ index 154a621fa..52b6847b8 100644
 +}
 +
 +// FP8 rows for 2..8 columns: each warp does rows_per_warp rows, so one activation load serves several rows.
-+template <int ncols_dst, int rows_per_warp>
++// ksplit warps share the same rows and split the row length, so small matrices still fill the GPU.
++template <int ncols_dst, int rows_per_warp, int ksplit>
 +static __global__ void mul_mat_vec_fp8_rows(
 +        const ggml_fp8_e4m3_t * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows,
 +        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
 +        const int channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
 +        const int sample_ratio, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst) {
 +    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-+    const int lane = threadIdx.x % warp_size;
-+    const int row0 = (blockIdx.x*(blockDim.x/warp_size) + threadIdx.x/warp_size) * rows_per_warp;
-+    if (row0 >= nrows) {
-+        return;
-+    }
++    constexpr int nwarps    = 4;
++    const int lane  = threadIdx.x % warp_size;
++    const int warp  = threadIdx.x / warp_size;
++    const int kpart = warp % ksplit;
++    const int row0  = (blockIdx.x*(nwarps/ksplit) + warp/ksplit) * rows_per_warp;
 +    const int channel_dst = blockIdx.y;
 +    const int sample_dst  = blockIdx.z;
 +    x   += int64_t(sample_dst/sample_ratio)*stride_sample_x + int64_t(channel_dst/channel_ratio)*stride_channel_x;
@@ -48,7 +134,7 @@ index 154a621fa..52b6847b8 100644
 +
 +    float sumf[ncols_dst][rows_per_warp] = {{0.0f}};
 +    uint32_t nan_bytes[rows_per_warp] = {0};
-+    for (int c = lane; c < ncols/16; c += warp_size) {
++    for (int c = kpart*warp_size + lane; c < ncols/16; c += ksplit*warp_size) {
 +        uint4 tmpx[rows_per_warp];
 +#pragma unroll
 +        for (int r = 0; r < rows_per_warp; ++r) {
@@ -68,19 +154,39 @@ index 154a621fa..52b6847b8 100644
 +        }
 +    }
 +
++    __shared__ float partial[nwarps][ncols_dst*rows_per_warp];
 +#pragma unroll
 +    for (int j = 0; j < ncols_dst; ++j) {
 +#pragma unroll
 +        for (int r = 0; r < rows_per_warp; ++r) {
 +            const float sum = warp_reduce_sum<warp_size>(nan_bytes[r] ? NAN : 256.0f*sumf[j][r]);
-+            if (lane == 0 && row0 + r < nrows) {
++            if constexpr (ksplit == 1) {
++                if (lane == 0 && row0 + r < nrows) {
++                    dst[j*stride_col_dst + row0 + r] = sum;
++                }
++            } else if (lane == 0) {
++                partial[warp][j*rows_per_warp + r] = sum;
++            }
++        }
++    }
++    if constexpr (ksplit > 1) {
++        __syncthreads();
++        if (kpart == 0 && lane < ncols_dst*rows_per_warp) {
++            const int j = lane / rows_per_warp;
++            const int r = lane % rows_per_warp;
++            float sum = 0.0f;
++#pragma unroll
++            for (int k = 0; k < ksplit; ++k) {
++                sum += partial[warp + k][lane];
++            }
++            if (row0 + r < nrows) {
 +                dst[j*stride_col_dst + row0 + r] = sum;
 +            }
 +        }
 +    }
 +}
 +
-+template <int ncols_dst, int rows_per_warp>
++template <int ncols_dst, int rows_per_warp, int ksplit>
 +static void launch_mul_mat_vec_fp8_rows(
 +        const ggml_fp8_e4m3_t * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
 +        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
@@ -89,10 +195,10 @@ index 154a621fa..52b6847b8 100644
 +        cudaStream_t stream) {
 +    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 +    constexpr int nwarps = 4;
-+    const int64_t rows_per_block = nwarps*rows_per_warp;
++    const int64_t rows_per_block = nwarps/ksplit*rows_per_warp;
 +    const dim3 block_nums((nrows + rows_per_block - 1)/rows_per_block, nchannels_dst, nsamples_dst);
 +    const dim3 block_dims(nwarps*warp_size, 1, 1);
-+    mul_mat_vec_fp8_rows<ncols_dst, rows_per_warp><<<block_nums, block_dims, 0, stream>>>(
++    mul_mat_vec_fp8_rows<ncols_dst, rows_per_warp, ksplit><<<block_nums, block_dims, 0, stream>>>(
 +        x, y, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
 +        nchannels_dst/nchannels_x, stride_channel_x, stride_channel_y, stride_channel_dst,
 +        nsamples_dst/nsamples_x, stride_sample_x, stride_sample_y, stride_sample_dst);
@@ -111,16 +217,17 @@ index 154a621fa..52b6847b8 100644
 +    if (ncols_dst < 2 || ncols_dst > 8 || !aligned || nchannels_dst % nchannels_x != 0 || nsamples_dst % nsamples_x != 0) {
 +        return false;
 +    }
-+#define LAUNCH_FP8_ROWS(ncd, rpw) launch_mul_mat_vec_fp8_rows<ncd, rpw>(x, y, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst, \
++#define LAUNCH_FP8_ROWS(ncd, rpw, ks) launch_mul_mat_vec_fp8_rows<ncd, rpw, ks>(x, y, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst, \
 +        nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream)
++    // rows per warp and K split tuned on RX 7900 XT (Llama 3.2 3B and a 16384x14336 weight)
 +    switch (ncols_dst) {
-+        case 2: LAUNCH_FP8_ROWS(2, 2); break;
-+        case 3: LAUNCH_FP8_ROWS(3, 2); break;
-+        case 4: LAUNCH_FP8_ROWS(4, 4); break;
-+        case 5: LAUNCH_FP8_ROWS(5, 4); break;
-+        case 6: LAUNCH_FP8_ROWS(6, 4); break;
-+        case 7: LAUNCH_FP8_ROWS(7, 2); break;
-+        case 8: LAUNCH_FP8_ROWS(8, 2); break;
++        case 2: LAUNCH_FP8_ROWS(2, 4, 2); break;
++        case 3: LAUNCH_FP8_ROWS(3, 4, 2); break;
++        case 4: LAUNCH_FP8_ROWS(4, 4, 2); break;
++        case 5: LAUNCH_FP8_ROWS(5, 4, 2); break;
++        case 6: LAUNCH_FP8_ROWS(6, 4, 2); break;
++        case 7: LAUNCH_FP8_ROWS(7, 4, 2); break;
++        case 8: LAUNCH_FP8_ROWS(8, 2, 2); break;
 +    }
 +#undef LAUNCH_FP8_ROWS
 +    return true;
@@ -130,7 +237,7 @@ index 154a621fa..52b6847b8 100644
  template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
  static __global__ void mul_mat_vec_f(
          const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-@@ -326,7 +447,47 @@ static __global__ void mul_mat_vec_f(
+@@ -326,7 +469,47 @@ static __global__ void mul_mat_vec_f(
  #endif
      } else if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
          const float2 * y2 = (const float2 *) y;
@@ -179,7 +286,7 @@ index 154a621fa..52b6847b8 100644
              const float2 tmpx = mmvf_load_fp8x2(x, col2);
              float2 tmpx_gate = {};
              if constexpr (has_fusion) {
-@@ -599,6 +760,18 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
+@@ -599,6 +782,18 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
          return;
      }
  
