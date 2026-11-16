@@ -9,22 +9,32 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOCK=/home/jonathans/Projects/wronggpu/build/rdna3-analysis/gpu-bench.lock
 PATCHED="$ROOT/build/llama.cpp/build-hip/bin"
 BASE="$ROOT/build/llama.cpp-base/build-hip/bin"
+# MODEL selects the GGUF set: models/<MODEL>-{auto,fp8-outq8,q8_0,f16}.gguf (default llama32-3b). Missing files are skipped.
 M="$ROOT/models"
-FP8="$M/llama32-3b-auto.gguf"
-FP8Q="$M/llama32-3b-fp8-outq8.gguf"
-Q8="$M/llama32-3b-q8_0.gguf"
-F16="$M/llama32-3b-f16.gguf"
+MODEL="${MODEL:-llama32-3b}"
+FP8="$M/$MODEL-auto.gguf"
+FP8Q="$M/$MODEL-fp8-outq8.gguf"
+Q8="$M/$MODEL-q8_0.gguf"
+F16="$M/$MODEL-f16.gguf"
 TEXT="$ROOT/build/ppl-text.txt"
-OUT="$ROOT/build/model-runs/$(date +%Y%m%d-%H%M%S)"
+OUT="$ROOT/build/model-runs/$(date +%Y%m%d-%H%M%S)-${MODEL:-llama32-3b}"
 mkdir -p "$OUT"
 SUMMARY="$OUT/summary.txt"
 export HIP_VISIBLE_DEVICES=0
 
 avail_gb() { awk '/MemAvailable/ {printf "%d", $2 / 1048576}' /proc/meminfo; }
 
-gpu() {  # gpu <log> <cmd...> : one locked, memory-capped GPU command
+gpu() {  # gpu <log> <cmd...> : one locked, memory-capped GPU command; skipped if its -m model file is missing
     local log=$1
     shift
+    local a prev=""
+    for a in "$@"; do
+        if [[ $prev == -m && ! -f $a ]]; then
+            echo "skip (no model file $a): $*" >> "$log"
+            return 0
+        fi
+        prev=$a
+    done
     local waited=0
     while (( $(avail_gb) < 8 )); do
         if (( $(avail_gb) < 3 || waited >= 1800 )); then

@@ -15,7 +15,8 @@ run = Path(sys.argv[1])
 def key(cmd):
     build = "patched" if "/build/llama.cpp/" in cmd else "base" if "/llama.cpp-base/" in cmd else "?"
     m = re.search(r"-m (\S+)", cmd)
-    return build, Path(m.group(1)).name.replace("llama32-3b-", "").replace(".gguf", "")
+    # model files are <family>-<size>-<variant>.gguf, e.g. llama31-8b-fp8-outq8.gguf
+    return build, Path(m.group(1)).name.removesuffix(".gguf").split("-", 2)[-1]
 
 
 bench = collections.defaultdict(list)
