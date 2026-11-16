@@ -11,8 +11,8 @@
 //
 // NaN codes (0x7F, 0xFF) make the whole output row NaN, as in llama.cpp: a per-word check while staging.
 //
-// Usage: fp8_gemm <N> [M K reps plain|nan v1|v2]; "nan" plants 0x7F in row 5 and 0xFF in the last row, which must be NaN in
-// every column while no other output is.
+// Usage: fp8_gemm <N> [M K reps plain|nan|bench variant...]; "nan" plants 0x7F in row 5 and 0xFF in the last row,
+// which must be NaN in every column while no other output is. "bench" times hipBLAS first, then the named variants.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>

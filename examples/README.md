@@ -6,6 +6,7 @@ measurement tools, not a library. The production kernels are in
 
 Common rules:
 
+- Run all commands below from this `examples/` folder.
 - Build with ROCm's `hipcc`: `hipcc -O3 -std=c++17 --offload-arch=gfx1100 <file> -o <name> -lamdhip64`. Some
   distributions' `hipcc` (Fedora's, for one) do not link the HIP runtime on their own, hence `-lamdhip64`.
 - The GPU programs read device 0 and refuse to run unless it is a gfx1100 card (`device 0 is ..., not the gfx1100

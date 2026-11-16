@@ -6,22 +6,40 @@ workarounds I found. Tested on an RX 7900 XT (gfx1100, 20 GB).
 RDNA 3 has no FP8 instructions. Most software therefore treats FP8 as a second-class format on these cards: slow,
 sometimes wrong, or refused. I wanted to know how much of that is the hardware and how much is software that was never
 tuned for it. For llama.cpp the answer is: mostly software. With the changes described here, FP8 models in llama.cpp on
-an RX 7900 XT give correct answers and run faster than the 8-bit Q8_0 format. That holds for one to eight parallel
-streams and for prompt processing, with about 5 % less memory. Before the changes, FP8 was about 2 to 3 times slower
+an RX 7900 XT give correct answers and run faster than the 8-bit Q8_0 format: 7 to 9 % faster for one stream, 3 to
+7 % for two to eight parallel streams (the smallest gains are close to the run-to-run spread), 12 to 20 % faster prompt
+processing, with about 5 % less memory. Before the changes, FP8 was about 2 to 3 times slower
 than Q8_0, and any prompt longer than 8 tokens gave NaN (the model printed "GGGG...").
 
 Status: research on one GPU and two models. Nothing has been sent to llama.cpp, PyTorch or dxil-spirv upstream yet.
 
 ## Contents
 
-1. [The state of FP8 on RDNA 3](#the-state-of-fp8-on-rdna-3)
-2. [Architecture limitations](#architecture-limitations)
-3. [Workarounds](#workarounds)
-4. [Results](#results)
-5. [Applying it](#applying-it)
-6. [Limits](#limits)
-7. [How this was made](#how-this-was-made)
-8. [Licence and credits](#licence-and-credits)
+1. [Terms](#terms)
+2. [The state of FP8 on RDNA 3](#the-state-of-fp8-on-rdna-3)
+3. [Architecture limitations](#architecture-limitations)
+4. [Workarounds](#workarounds)
+5. [Results](#results)
+6. [Applying it](#applying-it)
+7. [Limits](#limits)
+8. [How this was made](#how-this-was-made)
+9. [Licence and credits](#licence-and-credits)
+
+## Terms
+
+- **FP8 (E4M3):** an 8-bit float with 4 exponent bits and 3 mantissa bits, largest value 448. FP8 model files store
+  weights in it, plus a scale per tensor that the weights are multiplied by.
+- **Q8_0:** llama.cpp's own 8-bit format, the usual comparison point for an 8-bit model.
+- **Decode / prompt processing:** producing one token per step (1 to 8 tokens at once with parallel streams) versus
+  reading the prompt in large batches. Speeds are in tokens per second (t/s).
+- **WMMA:** RDNA 3's matrix instruction (16 x 16 x 16 tiles, FP16 or 8-bit integer inputs).
+- **Wave (warp):** a group of 32 GPU threads that run together. llama.cpp's code calls it a warp. **LDS:** the fast
+  memory shared by the threads of one block.
+- **Perplexity, KL divergence:** measures of how much a model's predictions change. Lower perplexity is better; a KL
+  divergence near 0 means the outputs match a reference almost exactly.
+- **FSR 4:** AMD's AI upscaler for games, whose neural network uses FP8. On Linux it reaches RDNA 3 through
+  vkd3d-proton (DirectX 12 on Vulkan) and its shader translator dxil-spirv, which emulate the FP8 instructions.
+- **WrongGPU:** an earlier project of mine that measured RDNA 3's instructions; the measurements here come from it.
 
 ## The state of FP8 on RDNA 3
 
@@ -31,15 +49,17 @@ the software involved is built for newer hardware first, and FP8 on RDNA 3 is a 
 | Problem | Owner | What I saw |
 |---|---|---|
 | No FP8 instructions in the vector units or in WMMA | AMD (hardware) | AMD's precision table lists FP8 as supported on RDNA 4 and CDNA, not on RDNA 3. Nothing to fix here, only to work around. |
-| FSR 4 is officially RDNA 4 only | AMD | FSR 4 runs on RDNA 3 only through community translation layers (vkd3d-proton and dxil-spirv). |
+| FSR 4 is officially RDNA 4 only | AMD | As far as I know, FSR 4 runs on RDNA 3 only through community translation layers (vkd3d-proton and dxil-spirv). |
 | FP8 decode is slow | llama.cpp | The HIP path converts one byte at a time in software. At batch 1 it reads 214 GB/s of weights, 28 % of the 754 GB/s the card can read. Q8_0 reaches 721 GB/s, F16 739 GB/s. |
-| FP8 models give NaN on prompts | llama.cpp | For more than 8 tokens at once, llama.cpp converts FP8 weights to FP16 and asks hipBLAS for FP16 output. The result overflows. Section [Avoiding the FP16 overflow](#e-avoiding-the-fp16-overflow). |
-| FP8 matmul is refused | PyTorch | `torch._scaled_mm` and FP8 `F.linear` raise on gfx1100. `_scaled_mm` is limited to MI300 and newer, and RDNA 4. |
+| FP8 models give NaN on prompts | llama.cpp | For more than 8 tokens at once, llama.cpp converts FP8 weights to FP16 and asks hipBLAS for FP16 output. The result overflows (INFERRED; forcing FP32 output removes the NaN). Section [Avoiding the FP16 overflow](#e-avoiding-the-fp16-overflow). |
+| FP8 matmul is refused | PyTorch | `torch._scaled_mm` and FP8 `F.linear` raise on gfx1100. The error names only MI300 and newer for ROCm; PyTorch's architecture list (read, not run) also has RDNA 4. |
 | FP8 only for some checkpoints | llama.cpp | The converter keeps FP8 only when each tensor has one scale. Per-channel and 128-block checkpoints are converted to 16 bit. It also asserts on the compressed-tensors `naive-quantized` variant, which has the same layout. |
-| FSR 4's FP8 path keeps FP16 precision | dxil-spirv (community) | The RDNA 3 emulation converts FP32 to FP16 and clamps to +-448. It never rounds to the FP8 grid. |
+| FSR 4's FP8 path keeps FP16 precision | dxil-spirv (community) | From reading the code: the RDNA 3 emulation converts FP32 to FP16 and clamps to +-448. It never rounds to the FP8 grid. |
 
-Four of these have a fix in this repo: decode speed and the NaN bug (one llama.cpp patch), FP8 in PyTorch (a small
-extension), and the FSR 4 rounding (a dxil-spirv patch, not yet tested in a game). The hardware limits stay.
+Five of these have a fix or partial fix in this repo: decode speed and the NaN bug (one llama.cpp patch), the
+`naive-quantized` checkpoints (a one-line converter patch; per-channel and block scales are still converted to 16 bit),
+FP8 in PyTorch (a small extension), and the FSR 4 rounding (a dxil-spirv patch, not yet tested in a game). The hardware
+limits stay.
 
 ## Architecture limitations
 
@@ -85,8 +105,9 @@ What this means for FP8 weights:
 
 E4M3 weights go up to 448. FP8 checkpoints store them unscaled and apply a per-tensor scale (about 1e-3 in the 3B model)
 later. FP16 tops out at 65504. A dot product over thousands of unscaled weights goes past that easily. If accumulation or
-output is FP16, the result becomes infinity and then NaN. This is the root of the llama.cpp NaN bug, and it limits any
-FP16 route on RDNA 3.
+output is FP16, the result becomes infinity and then NaN. This is the cause of the llama.cpp NaN bug (INFERRED: the
+infinity itself was not observed, but forcing FP32 output removes the NaN, see section e), and it limits any FP16 route
+on RDNA 3.
 
 ### The 80 MB Infinity Cache hides memory limits
 
@@ -260,10 +281,11 @@ Fixes 2 and 3 stay as fallbacks for shapes the kernel does not take.
 ### f. FP8 in PyTorch without native support
 
 `torch._scaled_mm` raises on gfx1100, and `F.linear` with an FP8 weight is not implemented. Converting FP8 to FP16 on
-every call works but costs 4057-4519 us at 16384 x 14336, against 826-945 us for FP16 weights kept resident.
+every call works but costs 4057-4519 us at 16384 x 14336, against 826-945 us for FP16 weights kept resident (first
+measurement run).
 
 `FP8Linear` keeps the weight as `float8_e4m3fn` in VRAM and calls the decode kernel through ctypes on PyTorch's stream.
-At 16384 x 14336 and batch 1 to 8:
+At 16384 x 14336 and batch 1 to 8 (second run, so the FP16 times differ slightly from the first):
 
 | Path | Time |
 |---|---|
@@ -272,7 +294,8 @@ At 16384 x 14336 and batch 1 to 8:
 | `FP8Linear`, FP16 activations | 330-403 us |
 | FP8 converted on every call | 4057-4519 us |
 
-That is 2.3 to 2.6x faster than PyTorch's FP16 path at half the weight memory. It handles batch 1 to 8 only: no prompt
+Against PyTorch's FP16 path that is 1.9 to 2.6x faster for the exact variant and 2.3 to 2.6x for the FP16-activation
+variant, at half the weight memory. It handles batch 1 to 8 only: no prompt
 path, no autograd, no `torch.compile`. PyTorch ships its own `libamdhip64.so` with the same name as the system one.
 Import torch first and both share PyTorch's copy. Files: [examples/pytorch/](examples/pytorch/).
 
@@ -281,10 +304,11 @@ Import torch first and both share PyTorch's copy. Files: [examples/pytorch/](exa
 FSR 4 can run on RDNA 3 through vkd3d-proton and dxil-spirv. I read dxil-spirv `114e664` (pinned by vkd3d-proton
 `5b1089c8`). Without native FP8, it holds FP8 matrices as FP16 cooperative matrices. Where RDNA 4 converts an FP32
 accumulator to FP8 with saturation, the RDNA 3 path converts FP32 to FP16 with round-toward-zero and then clamps to
-+-448. It never rounds to the E4M3 grid. Values passed between FSR 4's layers keep 11 bits of precision where RDNA 4 keeps
-4. So the RDNA 3 emulation computes a different, more precise network than the one AMD ships for RDNA 4. It is not an
-approximation of it. (FP8 loads already use the shift trick and are exact. Stores round to nearest, ties toward zero, from
-FP16, which is exact only for values already on the grid.)
++-448. It never rounds to the E4M3 grid. So values passed between FSR 4's layers would keep 11 bits of precision where
+RDNA 4 keeps 4, and the RDNA 3 emulation would compute a different, more precise network than the one AMD ships for RDNA
+4, not an approximation of it (INFERRED from the code; FSR 4 itself has not been run). (FP8 loads already use the shift
+trick and are exact. Stores round to nearest, ties toward zero, from FP16, which is exact only for values already on the
+grid.)
 
 The patch adds two `DXIL_SPIRV_CONFIG` options that round to the E4M3 grid first, using the magic-constant method from
 section b:
@@ -295,8 +319,8 @@ section b:
 
 With both unset, the output is unchanged. What I checked: all 30 AGS test shaders in dxil-spirv's own suite match their
 references with the option off and validate in all three modes. Only one shader differs between the workaround and the
-exact modes. A first version produced invalid SPIR-V (a select used a NaN test emitted after it); it was fixed and
-revalidated.
+exact modes, on the route that should be the one RDNA 3 with RADV takes; that is still to be confirmed in a game. A
+first version produced invalid SPIR-V (a select used a NaN test emitted after it); it was fixed and revalidated.
 
 What I have not done: **run it in a game.** I do not know yet whether the image gets closer to RDNA 4's, or how much
 slower it is. My expectation (INFERRED) is closer but not bit-identical, because of the WMMA inexactness above, and a bit
@@ -441,6 +465,7 @@ MIT, see [LICENSE](LICENSE). Copyright (c) 2026 j0nsh1n.
   https://github.com/phantoslayer21/wronggpu).
 - Models are not included. I used `RedHatAI/Llama-3.2-3B-Instruct-FP8` and `RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8`,
   under the Llama community licences.
-- The idea of widening FP8 weights to FP16 inside a matrix kernel is not new. FP8 Marlin (vLLM, for NVIDIA Ampere) and
-  feather-ops (for gfx1151 image models) do the same on other hardware. What I add is the RDNA 3 and llama.cpp work,
-  the exactness checks and the measurements.
+- The idea of widening FP8 weights to FP16 inside a matrix kernel is not new. FP8 Marlin (vLLM) does it on NVIDIA Ampere,
+  and feather-ops already does it with WMMA on gfx1151 (RDNA 3.5) for image models, the same design as my prompt
+  kernel. What I add is the decode kernels and llama.cpp integration for LLMs, the overflow fix, the exactness checks
+  and the measurements.
