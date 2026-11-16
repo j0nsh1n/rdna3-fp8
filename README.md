@@ -5,9 +5,8 @@ FP8 (E4M3) AI models on AMD RDNA 3 GPUs (Radeon RX 7000), which have no FP8 inst
 RDNA 3 cannot do FP8 math, but it can store FP8 weights in 8 bits and widen them to FP16 in registers. This repo does
 that inside llama.cpp, as a patch, and tests it on a Radeon RX 7900 XT (gfx1100). Unmodified llama.cpp is slow with FP8
 models on this GPU, and it prints garbage ("GGGG...") for any prompt longer than 8 tokens because of a bug. With the
-patch, the same FP8 files give correct answers and run as fast as, or a little faster than, the 8-bit Q8_0 format
-for one to seven parallel streams and for prompt processing. The gap that remains is 8 parallel streams, where FP8 is
-8 to 10 % slower than Q8_0. The repo also holds prototype kernels, a PyTorch extension, and an experimental patch for
+patch, the same FP8 files give correct answers and run faster than the 8-bit Q8_0 format for one to eight parallel
+streams and for prompt processing. The repo also holds prototype kernels, a PyTorch extension, and an experimental patch for
 the FSR 4 emulation layer (dxil-spirv) that is not yet tested in a game.
 
 Status: research. Everything was measured on one GPU. Nothing has been sent to llama.cpp or dxil-spirv upstream.
@@ -25,15 +24,14 @@ weights and not a 16-bit output layer. Tokens per second (t/s); higher is better
 | What | Q8_0 | FP8, patched | FP8 vs Q8_0 | FP8, unmodified llama.cpp |
 |---|---|---|---|---|
 | One stream, generation | 145.0 t/s | 157.8 t/s | +9 % | 66.2 t/s |
-| 2-7 parallel streams | | | +1 % to +7 % | 2.2 to 2.8x slower than Q8_0 |
-| 8 parallel streams | 845.8 t/s | 758.6 t/s | -10 % | 297.1 t/s |
+| 2-8 parallel streams | | | +3 % to +7 % | 2.2 to 2.9x slower than Q8_0 |
 | Prompt processing (512 tokens) | 7660-7678 t/s | 8545-8962 t/s | +12 % to +17 % | wrong output (NaN) |
 | Prompt processing (2048 tokens, `-ub 2048`) | 7563-7657 t/s | 9213-9225 t/s | +20 % | wrong output (NaN) |
 | GPU memory, peak in a run | 4369 MiB | 4175 MiB | -4 % | |
 | Answer quality (perplexity, lower is better) | 9.474 | 9.463 | same or slightly better | NaN |
 
-Notes: the one-stream and 512-token prompt numbers come from the final build. The parallel-stream numbers were
-measured before the prompt kernel was added; the prompt kernel does not change token generation. In two real prompts
+Notes: the one-stream and 512-token prompt numbers come from the final build. The parallel-stream ratios are from the
+final decode kernel ([notes/n8-gap-1.md](notes/n8-gap-1.md), 3 rounds of `llama-batched-bench`). In two real prompts
 (a refrigerator explanation and a Python prime check) the FP8 and Q8_0 replies were word for word identical. Unmodified
 llama.cpp printed only "GGGG...".
 
@@ -42,8 +40,7 @@ llama.cpp printed only "GGGG...".
 | What | Q8_0 | FP8, patched | FP8 vs Q8_0 | FP8, unmodified llama.cpp |
 |---|---|---|---|---|
 | One stream, generation | 76.3 t/s | 81.9 t/s | +7 % | 30.3 t/s |
-| 2-7 parallel streams | | | +1 % to +7 % | 2.7 to 3.3x slower than Q8_0 |
-| 8 parallel streams | 451.8 t/s | 417.5 t/s | -8 % | 138.0 t/s |
+| 2-8 parallel streams | | | +6 % to +7 % | 2.7 to 3.3x slower than Q8_0 |
 | Prompt processing (512 tokens) | 3469.6 t/s | 4048.5 t/s | +17 % | wrong output (NaN) |
 | GPU memory | not measured | not measured | | |
 | Answer quality (perplexity, lower is better) | 7.2763 | 7.2655 | same or slightly better | NaN |
@@ -156,7 +153,6 @@ unset the output is unchanged. All 30 AGS test shaders in dxil-spirv's own test 
 
 ## Limitations and open items
 
-- 8 parallel streams: FP8 is 10 % (3B) and 8 % (8B) slower than Q8_0. Up to 7 streams it is faster.
 - One GPU model tested (RX 7900 XT, 20 GB). Other RDNA 3 cards are untested.
 - Two models tested, both Llama. Other models, sizes, mixture-of-experts shapes and Vulkan are untested.
 - The prompt kernel handles shapes where rows are a multiple of 128 and the row length a multiple of 64; others

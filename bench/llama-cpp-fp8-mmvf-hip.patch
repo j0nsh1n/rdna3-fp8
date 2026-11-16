@@ -315,10 +315,10 @@ index 540c53614..b06df472d 100644
              if (!with_bias && src0->type == GGML_TYPE_NVFP4 && src1->type == GGML_TYPE_F32 && mm_node->type == GGML_TYPE_F32) {
                  const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index 154a621fa..3c7d5e1c2 100644
+index 154a621fa..99fb7409b 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
-@@ -13,6 +13,149 @@ static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t *
+@@ -13,6 +13,181 @@ static __device__ __forceinline__ float2 mmvf_load_fp8x2(const ggml_fp8_e4m3_t *
  #endif
  }
  
@@ -345,7 +345,7 @@ index 154a621fa..3c7d5e1c2 100644
 +
 +// FP8 rows for 2..8 columns: each warp does rows_per_warp rows, so one activation load serves several rows.
 +// ksplit warps share the same rows and split the row length, so small matrices still fill the GPU.
-+template <int ncols_dst, int rows_per_warp, int ksplit>
++template <int ncols_dst, int rows_per_warp, int ksplit, int ygroup>
 +static __global__ void mul_mat_vec_fp8_rows(
 +        const ggml_fp8_e4m3_t * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows,
 +        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
@@ -365,7 +365,16 @@ index 154a621fa..3c7d5e1c2 100644
 +
 +    float sumf[ncols_dst][rows_per_warp] = {{0.0f}};
 +    uint32_t nan_bytes[rows_per_warp] = {0};
++    // ygroup > 0: the activations are loaded ygroup columns at a time with a scheduling barrier around each group. That keeps the
++    // compiler from hoisting every load of the loop body (which needs about 190 registers and halves the wave count), and the
++    // block-uniform column pointers plus one 32-bit offset avoid 64-bit address arithmetic per column. ygroup == 0: plain loop.
++    const char * ycol[ncols_dst];
++#pragma unroll
++    for (int j = 0; j < ncols_dst; ++j) {
++        ycol[j] = (const char *) (y + j*stride_col_y);
++    }
 +    for (int c = kpart*warp_size + lane; c < ncols/16; c += ksplit*warp_size) {
++        const uint32_t yoff = (uint32_t) c * 64u;
 +        uint4 tmpx[rows_per_warp];
 +#pragma unroll
 +        for (int r = 0; r < rows_per_warp; ++r) {
@@ -374,13 +383,36 @@ index 154a621fa..3c7d5e1c2 100644
 +            const uint32x4_t v = __builtin_nontemporal_load((const uint32x4_t *) (x + min(row0 + r, nrows - 1)*stride_row) + c);
 +            tmpx[r] = make_uint4(v.x, v.y, v.z, v.w);
 +        }
++        if constexpr (ygroup == 0) {
 +#pragma unroll
-+        for (int j = 0; j < ncols_dst; ++j) {
-+            const float4 * y4 = (const float4 *) (y + j*stride_col_y) + 4*c;
-+            const float4 tmpy[4] = {y4[0], y4[1], y4[2], y4[3]};
++            for (int j = 0; j < ncols_dst; ++j) {
++                const float4 * y4 = (const float4 *) (y + j*stride_col_y) + 4*c;
++                const float4 tmpy[4] = {y4[0], y4[1], y4[2], y4[3]};
 +#pragma unroll
-+            for (int r = 0; r < rows_per_warp; ++r) {
-+                nan_bytes[r] |= mmvf_fma_fp8x16(sumf[j][r], tmpx[r], tmpy);
++                for (int r = 0; r < rows_per_warp; ++r) {
++                    nan_bytes[r] |= mmvf_fma_fp8x16(sumf[j][r], tmpx[r], tmpy);
++                }
++            }
++        } else {
++#pragma unroll
++            for (int g = 0; g < ncols_dst; g += ygroup) {
++                float4 tmpy[ygroup][4];
++#pragma unroll
++                for (int jj = 0; jj < ygroup; ++jj) {
++                    const float4 * y4 = (const float4 *) (ycol[min(g + jj, ncols_dst - 1)] + yoff);
++                    tmpy[jj][0] = y4[0]; tmpy[jj][1] = y4[1]; tmpy[jj][2] = y4[2]; tmpy[jj][3] = y4[3];
++                }
++                __builtin_amdgcn_sched_barrier(0);
++#pragma unroll
++                for (int jj = 0; jj < ygroup; ++jj) {
++                    if (g + jj < ncols_dst) {
++#pragma unroll
++                        for (int r = 0; r < rows_per_warp; ++r) {
++                            nan_bytes[r] |= mmvf_fma_fp8x16(sumf[g + jj][r], tmpx[r], tmpy[jj]);
++                        }
++                    }
++                }
++                __builtin_amdgcn_sched_barrier(0);
 +            }
 +        }
 +    }
@@ -417,7 +449,7 @@ index 154a621fa..3c7d5e1c2 100644
 +    }
 +}
 +
-+template <int ncols_dst, int rows_per_warp, int ksplit>
++template <int ncols_dst, int rows_per_warp, int ksplit, int ygroup>
 +static void launch_mul_mat_vec_fp8_rows(
 +        const ggml_fp8_e4m3_t * x, const float * y, float * dst, const int64_t ncols, const int64_t nrows,
 +        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
@@ -429,7 +461,7 @@ index 154a621fa..3c7d5e1c2 100644
 +    const int64_t rows_per_block = nwarps/ksplit*rows_per_warp;
 +    const dim3 block_nums((nrows + rows_per_block - 1)/rows_per_block, nchannels_dst, nsamples_dst);
 +    const dim3 block_dims(nwarps*warp_size, 1, 1);
-+    mul_mat_vec_fp8_rows<ncols_dst, rows_per_warp, ksplit><<<block_nums, block_dims, 0, stream>>>(
++    mul_mat_vec_fp8_rows<ncols_dst, rows_per_warp, ksplit, ygroup><<<block_nums, block_dims, 0, stream>>>(
 +        x, y, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
 +        nchannels_dst/nchannels_x, stride_channel_x, stride_channel_y, stride_channel_dst,
 +        nsamples_dst/nsamples_x, stride_sample_x, stride_sample_y, stride_sample_dst);
@@ -448,17 +480,17 @@ index 154a621fa..3c7d5e1c2 100644
 +    if (ncols_dst < 2 || ncols_dst > 8 || !aligned || nchannels_dst % nchannels_x != 0 || nsamples_dst % nsamples_x != 0) {
 +        return false;
 +    }
-+#define LAUNCH_FP8_ROWS(ncd, rpw, ks) launch_mul_mat_vec_fp8_rows<ncd, rpw, ks>(x, y, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst, \
++#define LAUNCH_FP8_ROWS(ncd, rpw, ks, yg) launch_mul_mat_vec_fp8_rows<ncd, rpw, ks, yg>(x, y, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst, \
 +        nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream)
-+    // rows per warp and K split tuned on RX 7900 XT (Llama 3.2 3B and a 16384x14336 weight)
++    // rows per warp, K split and activation grouping tuned on RX 7900 XT (Llama 3.2 3B, Llama 3.1 8B and a 16384x14336 weight)
 +    switch (ncols_dst) {
-+        case 2: LAUNCH_FP8_ROWS(2, 4, 2); break;
-+        case 3: LAUNCH_FP8_ROWS(3, 4, 2); break;
-+        case 4: LAUNCH_FP8_ROWS(4, 4, 2); break;
-+        case 5: LAUNCH_FP8_ROWS(5, 4, 2); break;
-+        case 6: LAUNCH_FP8_ROWS(6, 4, 2); break;
-+        case 7: LAUNCH_FP8_ROWS(7, 4, 2); break;
-+        case 8: LAUNCH_FP8_ROWS(8, 2, 2); break;
++        case 2: LAUNCH_FP8_ROWS(2, 4, 2, 0); break;
++        case 3: LAUNCH_FP8_ROWS(3, 4, 2, 0); break;
++        case 4: LAUNCH_FP8_ROWS(4, 4, 2, 0); break;
++        case 5: LAUNCH_FP8_ROWS(5, 4, 2, 0); break;
++        case 6: LAUNCH_FP8_ROWS(6, 4, 2, 0); break;
++        case 7: LAUNCH_FP8_ROWS(7, 4, 2, 2); break;
++        case 8: LAUNCH_FP8_ROWS(8, 4, 2, 2); break;
 +    }
 +#undef LAUNCH_FP8_ROWS
 +    return true;
@@ -468,7 +500,7 @@ index 154a621fa..3c7d5e1c2 100644
  template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
  static __global__ void mul_mat_vec_f(
          const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-@@ -326,7 +469,47 @@ static __global__ void mul_mat_vec_f(
+@@ -326,7 +501,47 @@ static __global__ void mul_mat_vec_f(
  #endif
      } else if constexpr (std::is_same_v<T, ggml_fp8_e4m3_t>) {
          const float2 * y2 = (const float2 *) y;
@@ -517,7 +549,7 @@ index 154a621fa..3c7d5e1c2 100644
              const float2 tmpx = mmvf_load_fp8x2(x, col2);
              float2 tmpx_gate = {};
              if constexpr (has_fusion) {
-@@ -599,6 +782,18 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
+@@ -599,6 +814,18 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
          return;
      }
  

@@ -14,8 +14,7 @@ the end hold the detailed runs. Start with [README.md](README.md) for the short 
 | What | FP8 vs Q8_0 | Unmodified llama.cpp |
 |---|---|---|
 | Generation, one stream | +9 % (157.8 vs 145.0 t/s) | 66.2 t/s |
-| 2-7 parallel streams | +1 % to +7 % | 2.2 to 2.8x slower than Q8_0 |
-| 8 parallel streams | -10 % (open) | |
+| 2-8 parallel streams | +3 % to +7 % | 2.2 to 2.9x slower than Q8_0 |
 | Prompt processing, pp512 | +12 % to +17 % (8545-8962 vs 7660-7678 t/s) | NaN output |
 | GPU memory, peak in a run | -4 % (4175 vs 4369 MiB) | |
 | Answer quality | same as Q8_0, closer to exact | "GGGG..." on prompts over 8 tokens |
@@ -104,15 +103,20 @@ activations must be packed in the same order. A dot product does not care about 
     from 1.04-1.10x to 0.93x Q8_0's time on the big weight.
   - `ksplit` = 2 warps per row group, splitting the row length (partial sums through LDS). Small model layers
     (1024 x 3072) need it: with 4 rows per warp only 64 blocks were left for 84 compute units.
-  - Final setting, from sweeps in the model and on the big weight: 4 rows per warp for 2 to 7 columns, 2 for 8,
-    ksplit 2. With it, FP8 takes 0.91-0.97x Q8_0's time at every n = 1..8 on the 16384 x 14336 weight.
+  - Final setting, from sweeps in the models and on the big weight: 4 rows per warp and ksplit 2 for 2 to 8 columns;
+    7 and 8 columns load the activations two columns at a time (below). FP8 then takes 0.74-0.92x Q8_0's time at every
+    n = 1..8 on the 16384 x 14336 weight (notes/n8-gap-1.md).
 - Did not help: `__launch_bounds__(128)` (no effect); converting each widened weight to FP32 so the products can
   dual-issue as `v_dual_fmac_f32` (the compiler pairs few; 2-3 %, within noise; 1.6-1.9x slower at 1 row per warp).
 - Correctness, KL divergence against unmodified llama.cpp's exact F32 decode path (8-token batches as reference):
   0.000002-0.000004 at 1-, 3- and 8-token batches on 3B (same top token 99.9 %), 0.000002-0.000005 on 8B. Q8_0 is
   0.000605 (3B) and 0.000544 (8B) from the same reference.
-- Eight parallel streams stay open: on the 3B model FP8 gives 758.6 t/s at 8 streams against 771.2 at 7, so the
-  8-column setting is the weak point. On 8B the totals at 7 and 8 streams are the same (417.5 t/s).
+- Eight parallel streams were the last gap (0.90x Q8_0 on 3B, 0.92x on 8B). The 8-column loop did 64-bit address math
+  per column and waited on each column's loads; removing only the address math made the compiler hoist every load
+  (about 190 registers, half the waves) and run slower. Loading the activations two columns at a time between
+  scheduling barriers, from per-column pointers plus a 32-bit offset, with 4 rows per warp at 8 columns, fixed it:
+  1.03x (3B) and 1.07x (8B) at 8 streams, and FP8 takes 0.74x Q8_0's time at n = 8 on the 16384 x 14336 weight
+  (MEASURED, notes/n8-gap-1.md). 2 to 6 columns keep the old loop.
 
 ## 6. Prompt processing (more than 8 tokens): FP8 WMMA GEMM
 
@@ -155,6 +159,7 @@ Llama 3.2 3B Instruct FP8 ([notes/model-test-1.md](notes/model-test-1.md); run 3
 | Q8_0 | 142.8 | 261.5 | 379.0 | 488.9 | 586.7 | 675.8 | 763.5 | 845.8 |
 | FP8 patched | 156.6 | 280.8 | 405.0 | 524.7 | 621.3 | 706.0 | 771.2 | 758.6 |
 | FP8 / Q8_0 | 1.10 | 1.07 | 1.07 | 1.07 | 1.06 | 1.04 | 1.01 | 0.90 |
+| FP8 / Q8_0, final decode kernel (notes/n8-gap-1.md, 3 rounds) | 1.10 | 1.07 | 1.07 | 1.07 | 1.06 | 1.05 | 1.04 | 1.03 |
 | FP8 unmodified | 65.7 | 113.8 | 161.1 | 201.9 | 241.4 | 273.7 | 271.5 | 297.1 |
 
   This table is from the run before the WMMA prompt kernel was added; decode kernels were not changed after it.
@@ -179,6 +184,7 @@ Llama 3.1 8B Instruct FP8 ([notes/model-test-8b.md](notes/model-test-8b.md); run
 | Q8_0 | 76.3 | 140.9 | 203.8 | 266.8 | 323.6 | 374.0 | 415.0 | 451.8 |
 | FP8 patched | 81.7 | 149.2 | 218.5 | 279.9 | 340.8 | 395.8 | 417.5 | 417.5 |
 | FP8 / Q8_0 | 1.07 | 1.06 | 1.07 | 1.05 | 1.05 | 1.06 | 1.01 | 0.92 |
+| FP8 / Q8_0, final decode kernel (notes/n8-gap-1.md, 3 rounds) | 1.08 | 1.07 | 1.07 | 1.06 | 1.06 | 1.06 | 1.06 | 1.07 |
 
 - Perplexity (50 chunks of a fixed local text): FP8 as shipped 7.2683, FP8 with Q8_0 output 7.2655, Q8_0 7.2763;
   unmodified FP8 NaN. Decode KL divergence 0.000002-0.000005; prompts 0.000172; Q8_0 0.000544.
@@ -287,8 +293,6 @@ round trip with the game closed restored all 139 files.
 
 ## 11. Open items
 
-- 8 parallel streams: FP8 is about 10 % behind Q8_0 in the 3B model and 8 % in 8B (ahead on the 16384 x 14336
-  weight).
 - Prompt kernel: per-shape tile choice or split-K for the small K/V layers.
 - No independent review of the llama.cpp patch yet.
 - Untested: other models and sizes, other RDNA 3 cards, RDNA 4 (the WMMA kernel is RDNA 3 only by design; RDNA 4
