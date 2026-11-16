@@ -1,0 +1,310 @@
+diff --git a/dxil_converter.cpp b/dxil_converter.cpp
+index 26e858a3..cf29443e 100644
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -7779,7 +7779,8 @@ bool Converter::Impl::emit_execution_modes_fp_denorm_rounding()
+ 	}
+ #endif
+ 
+-	if (shader_analysis.require_wmma && GlobalConfiguration::get().wmma_rdna3_workaround)
++	if (shader_analysis.require_wmma && GlobalConfiguration::get().wmma_rdna3_workaround &&
++	    !GlobalConfiguration::get().wmma_rdna3_rte)
+ 	{
+ 		// FP16 RTZ allows faster conversions on AMD.
+ 		// This hack only makes sense on RDNA3.
+@@ -10201,6 +10202,17 @@ GlobalConfiguration::GlobalConfiguration()
+ 	{
+ 		if (strcmp(env, "wmma_rdna3_workaround") == 0)
+ 			wmma_rdna3_workaround = true;
++		else if (strcmp(env, "wmma_rdna3_exact_fp8") == 0)
++		{
++			wmma_rdna3_workaround = true;
++			wmma_rdna3_exact_fp8 = true;
++		}
++		else if (strcmp(env, "wmma_rdna3_exact_fp8_rte") == 0)
++		{
++			wmma_rdna3_workaround = true;
++			wmma_rdna3_exact_fp8 = true;
++			wmma_rdna3_rte = true;
++		}
+ 		else if (strcmp(env, "wmma_conv_hack") == 0)
+ 			wmma_conv_hack = true;
+ 		else if (strcmp(env, "debug_simulate_min16float_min_spec") == 0)
+diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
+index 0da1d9e0..160bea7b 100644
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -170,6 +170,10 @@ public:
+ 	// Only used for temporary hackery and testing.
+ 	static const GlobalConfiguration &get();
+ 	bool wmma_rdna3_workaround = false;
++	// Round to the E4M3 grid (RTNE, saturating) where RDNA4 converts to FP8, instead of keeping F16 precision.
++	bool wmma_rdna3_exact_fp8 = false;
++	// Do not force RTZ for F16 conversions in WMMA shaders.
++	bool wmma_rdna3_rte = false;
+ 	bool wmma_conv_hack = false;
+ 	bool simulate_min16float_min_spec = false;
+ 	bool experimental_unstructured_control_flow = false;
+diff --git a/opcodes/dxil/dxil_ags.cpp b/opcodes/dxil/dxil_ags.cpp
+index 6426251c..ec531969 100644
+--- a/opcodes/dxil/dxil_ags.cpp
++++ b/opcodes/dxil/dxil_ags.cpp
+@@ -401,6 +401,26 @@ static spv::Id emit_coopmat_saturate_fp8(Converter::Impl &impl, spv::Id v, spv::
+ 	return call->id;
+ }
+ 
++static spv::Id emit_coopmat_round_fp8(Converter::Impl &impl, spv::Id v, spv::Id type_id, bool f16)
++{
++	spv::Id call_id = impl.spirv_module.get_helper_call_id(
++	    f16 ? HelperCall::CoopMatRoundFP8F16 : HelperCall::CoopMatRoundFP8F32, type_id);
++
++	// RADV workaround. Should pass as value, but NIR aborts.
++	spv::Id param = impl.create_variable(spv::StorageClassFunction, type_id);
++	auto *store = impl.allocate(spv::OpStore);
++	store->add_id(param);
++	store->add_id(v);
++	impl.add(store);
++
++	auto *call = impl.allocate(spv::OpFunctionCall, type_id);
++	call->add_id(call_id);
++	call->add_id(param);
++	impl.add(call);
++
++	return call->id;
++}
++
+ static spv::Id emit_coopmat_transpose_with_convert(
+     Converter::Impl &impl, spv::Id v, uint32_t input_imm, uint32_t output_imm, bool saturating)
+ {
+@@ -443,11 +463,21 @@ static spv::Id emit_coopmat_transpose_with_convert(
+ 			output_accum_imm |= AmdExtD3DShaderIntrinsicsWaveMatrixType_Accumulator <<
+ 			                    AmdExtD3DShaderIntrinsicsWaveMatrixModifier_MatrixTypeFlagShift;
+ 
++			// Exact mode rounds in F32 before the F16 conversion; rounding after it could round twice.
++			bool exact = GlobalConfiguration::get().wmma_rdna3_exact_fp8;
++			if (exact && effective_input_fmt == AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_F32)
++				v = emit_coopmat_round_fp8(impl, v, build_coopmat_type(impl, input_imm, false), false);
++
+ 			auto *conv = impl.allocate(spv::OpFConvert, build_coopmat_type(impl, output_accum_imm, false));
+ 			conv->add_id(v);
+ 			impl.add(conv);
+ 
+-			v = emit_coopmat_saturate_fp8(impl, conv->id, build_coopmat_type(impl, output_accum_imm, false));
++			if (!exact)
++				v = emit_coopmat_saturate_fp8(impl, conv->id, build_coopmat_type(impl, output_accum_imm, false));
++			else if (effective_input_fmt == AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_F32)
++				v = conv->id;
++			else
++				v = emit_coopmat_round_fp8(impl, conv->id, build_coopmat_type(impl, output_accum_imm, false), true);
+ 
+ 			effective_input_fmt = effective_output_fmt;
+ 			saturating = false;
+@@ -497,6 +527,16 @@ static spv::Id emit_coopmat_transpose_with_convert(
+ 		builder.addExtension("SPV_NV_cooperative_matrix2");
+ 		builder.addCapability(spv::CapabilityCooperativeMatrixConversionsNV);
+ 
++		// Exact mode: an F32 source is rounded to the E4M3 grid before converting, so the F16 result is exact.
++		bool rounded_f32 = false;
++		if (saturating && GlobalConfiguration::get().wmma_rdna3_exact_fp8 && !impl.options.wmma_fp8 &&
++		    get_type_data_format(output_imm) == AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_FP8 &&
++		    get_type_data_format(input_imm) == AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_F32)
++		{
++			v = emit_coopmat_round_fp8(impl, v, build_coopmat_type(impl, input_imm, false), false);
++			rounded_f32 = true;
++		}
++
+ 		auto *conv = impl.allocate(opcode, build_coopmat_type(impl, output_imm, false));
+ 		conv->add_id(v);
+ 		impl.add(conv);
+@@ -514,7 +554,10 @@ static spv::Id emit_coopmat_transpose_with_convert(
+ 			         get_type_data_format(input_imm) != AmdExtD3DShaderIntrinsicsWaveMatrixDataFormat_FP8 &&
+ 			         !impl.options.wmma_fp8)
+ 			{
+-				id = emit_coopmat_saturate_fp8(impl, id, build_coopmat_type(impl, output_imm, false));
++				if (!GlobalConfiguration::get().wmma_rdna3_exact_fp8)
++					id = emit_coopmat_saturate_fp8(impl, id, build_coopmat_type(impl, output_imm, false));
++				else if (!rounded_f32)
++					id = emit_coopmat_round_fp8(impl, id, build_coopmat_type(impl, output_imm, false), true);
+ 			}
+ 		}
+ 
+diff --git a/spirv_module.cpp b/spirv_module.cpp
+index 7cf68958..2e0a84ae 100644
+--- a/spirv_module.cpp
++++ b/spirv_module.cpp
+@@ -80,6 +80,7 @@ struct SPIRVModule::Impl : BlockEmissionInterface
+ 	spv::Id build_fp8_to_fp16(SPIRVModule &module, const spv::Id *ids, uint32_t id_count, bool coopmat);
+ 	spv::Id build_fp16_to_fp8(SPIRVModule &module, const spv::Id *ids, uint32_t id_count, bool coopmat);
+ 	spv::Id build_coop_mat_saturate_fp8(SPIRVModule &module, spv::Id type_id);
++	spv::Id build_coop_mat_round_fp8(SPIRVModule &module, spv::Id type_id, bool f16);
+ 	spv::Id build_coop_mat_transfer(SPIRVModule &module, const spv::Id *ids, uint32_t id_count);
+ 	spv::Id build_coop_mat_saturation_fixup(SPIRVModule &module, spv::Id type_id);
+ 	spv::Id build_is_quad_uniform_control_flow(SPIRVModule &module);
+@@ -2937,6 +2938,143 @@ spv::Id SPIRVModule::Impl::build_coop_mat_saturate_fp8(SPIRVModule &module, spv:
+ 	return func->getId();
+ }
+ 
++// Rounds every element to the nearest E4M3 value in F32 (ties to even, saturating at +-448, NaN kept), so the result is
++// exact in F16. Matches RDNA4's saturating F32 -> FP8 conversion. With C = 1.5 * 2^(E + 20) for the exponent E of
++// clamp(|x|, 2^-6, 448), (|x| + C) - C rounds |x| to a multiple of 2^(E - 3); 2^-6 as the floor gives the subnormal step.
++spv::Id SPIRVModule::Impl::build_coop_mat_round_fp8(SPIRVModule &module, spv::Id type_id, bool f16)
++{
++	HelperCall helper = f16 ? HelperCall::CoopMatRoundFP8F16 : HelperCall::CoopMatRoundFP8F32;
++	for (auto &ops : coop_mat_conv_ids)
++		if (ops.output_type == type_id && ops.input_type == type_id && ops.call == helper)
++			return ops.func_id;
++
++	auto *current_build_point = builder.getBuildPoint();
++
++	spv::Block *entry = nullptr;
++	spv::Id uint_type = builder.makeUintType(32);
++	spv::Id bool_type = builder.makeBoolType();
++	spv::Id f32_type = builder.makeFloatType(32);
++	spv::Id elem_type = f16 ? builder.makeFloatType(16) : f32_type;
++
++	// RADV workaround. It fails to understand coopmat passed as value.
++	spv::Id ptr_type = builder.makePointer(spv::StorageClassFunction, type_id);
++
++	auto *func = builder.makeFunctionEntry(spv::NoPrecision, type_id,
++	                                       f16 ? "CoopMatRoundFP8F16" : "CoopMatRoundFP8F32",
++	                                       { ptr_type }, {}, &entry);
++
++	spv::Id output_id = create_variable(spv::StorageClassFunction, type_id, "coop_output");
++	auto *len = builder.addInstruction(uint_type, spv::OpCooperativeMatrixLengthKHR);
++	len->addIdOperand(type_id);
++
++	auto *header = func->newBlock(builder.getUniqueId());
++	auto *merge = func->newBlock(builder.getUniqueId());
++	builder.createBranch(header);
++	builder.setBuildPoint(header);
++	{
++		auto *phi = builder.addInstruction(uint_type, spv::OpPhi);
++		auto *iter = builder.addInstruction(uint_type, spv::OpIAdd);
++		iter->addIdOperand(phi->getResultId());
++		iter->addIdOperand(builder.makeUintConstant(1));
++
++		phi->addIdOperand(builder.makeUintConstant(0));
++		phi->addIdOperand(entry->getId());
++		phi->addIdOperand(iter->getResultId());
++		phi->addIdOperand(header->getId());
++
++		auto *input_chain = builder.addInstruction(
++		    builder.makePointer(spv::StorageClassFunction, elem_type), spv::OpInBoundsAccessChain);
++		input_chain->addIdOperand(func->getParamId(0));
++		input_chain->addIdOperand(phi->getResultId());
++
++		auto *load = builder.addInstruction(elem_type, spv::OpLoad);
++		load->addIdOperand(input_chain->getResultId());
++		spv::Id x = load->getResultId();
++
++		if (f16)
++		{
++			auto *widen = builder.addInstruction(f32_type, spv::OpFConvert);
++			widen->addIdOperand(x);
++			x = widen->getResultId();
++		}
++
++		spv::Id glsl450 = builder.import("GLSL.std.450");
++		const auto op1 = [&](spv::Id type, spv::Op op, spv::Id a) {
++			auto *i = builder.addInstruction(type, op);
++			i->addIdOperand(a);
++			return i->getResultId();
++		};
++		const auto op2 = [&](spv::Id type, spv::Op op, spv::Id a, spv::Id b) {
++			auto *i = builder.addInstruction(type, op);
++			i->addIdOperand(a);
++			i->addIdOperand(b);
++			return i->getResultId();
++		};
++		const auto nclamp = [&](spv::Id a, float lo, float hi) {
++			auto *i = builder.addInstruction(f32_type, spv::OpExtInst);
++			i->addIdOperand(glsl450);
++			i->addImmediateOperand(GLSLstd450NClamp);
++			i->addIdOperand(a);
++			i->addIdOperand(builder.makeFloatConstant(lo));
++			i->addIdOperand(builder.makeFloatConstant(hi));
++			return i->getResultId();
++		};
++
++		spv::Id bits = op1(uint_type, spv::OpBitcast, x);
++		auto *abs = builder.addInstruction(f32_type, spv::OpExtInst);
++		abs->addIdOperand(glsl450);
++		abs->addImmediateOperand(GLSLstd450FAbs);
++		abs->addIdOperand(x);
++		spv::Id ax = abs->getResultId();
++
++		spv::Id cb = op2(uint_type, spv::OpBitwiseAnd, op1(uint_type, spv::OpBitcast, nclamp(ax, 0.015625f, 448.0f)),
++		                 builder.makeUintConstant(0x7f800000u));
++		cb = op2(uint_type, spv::OpIAdd, cb, builder.makeUintConstant(0x0a400000u));
++		spv::Id c = op1(f32_type, spv::OpBitcast, cb);
++
++		// Must stay two rounded operations; NoContraction keeps the compiler from folding them away.
++		spv::Id sum = op2(f32_type, spv::OpFAdd, ax, c);
++		builder.addDecoration(sum, spv::DecorationNoContraction);
++		spv::Id r = op2(f32_type, spv::OpFSub, sum, c);
++		builder.addDecoration(r, spv::DecorationNoContraction);
++		r = nclamp(r, 0.0f, 448.0f);
++
++		spv::Id rb = op1(uint_type, spv::OpBitcast, r);
++		spv::Id is_nan = op1(bool_type, spv::OpIsNan, x);
++		auto *sel = builder.addInstruction(uint_type, spv::OpSelect);
++		sel->addIdOperand(is_nan);
++		sel->addIdOperand(builder.makeUintConstant(0x7fc00000u));
++		sel->addIdOperand(rb);
++		rb = op2(uint_type, spv::OpBitwiseOr, sel->getResultId(),
++		         op2(uint_type, spv::OpBitwiseAnd, bits, builder.makeUintConstant(0x80000000u)));
++		spv::Id y = op1(f32_type, spv::OpBitcast, rb);
++		if (f16)
++			y = op1(elem_type, spv::OpFConvert, y);
++
++		auto *output_chain = builder.addInstruction(
++		    builder.makePointer(spv::StorageClassFunction, elem_type), spv::OpInBoundsAccessChain);
++		output_chain->addIdOperand(output_id);
++		output_chain->addIdOperand(phi->getResultId());
++		auto *store = builder.addInstruction(spv::OpStore);
++		store->addIdOperand(output_chain->getResultId());
++		store->addIdOperand(y);
++
++		auto *cmp = builder.addInstruction(bool_type, spv::OpULessThan);
++		cmp->addIdOperand(iter->getResultId());
++		cmp->addIdOperand(len->getResultId());
++		builder.createLoopMerge(merge, header, 0);
++		builder.createConditionalBranch(cmp->getResultId(), header, merge);
++	}
++
++	builder.setBuildPoint(merge);
++	auto *loaded_result = builder.addInstruction(type_id, spv::OpLoad);
++	loaded_result->addIdOperand(output_id);
++	builder.makeReturnValue(loaded_result->getResultId());
++	builder.setBuildPoint(current_build_point);
++	coop_mat_conv_ids.push_back({ type_id, type_id, func->getId(), helper });
++	return func->getId();
++}
++
+ static spv::Id make_u16vec_constant(spv::Builder &builder, uint16_t val, bool vec2)
+ {
+ 	spv::Id constant = builder.makeUint16Constant(val);
+@@ -3364,6 +3502,10 @@ spv::Id SPIRVModule::Impl::get_helper_call_id(SPIRVModule &module, HelperCall ca
+ 		return build_coop_mat_saturation_fixup(module, type_id);
+ 	case HelperCall::CoopMatSaturateFP8:
+ 		return build_coop_mat_saturate_fp8(module, type_id);
++	case HelperCall::CoopMatRoundFP8F32:
++		return build_coop_mat_round_fp8(module, type_id, false);
++	case HelperCall::CoopMatRoundFP8F16:
++		return build_coop_mat_round_fp8(module, type_id, true);
+ 	case HelperCall::ByteAddressMask:
+ 		return build_byte_address_mask_id(module);
+ 	case HelperCall::UDiv:
+diff --git a/spirv_module.hpp b/spirv_module.hpp
+index 2d53ac60..7dca7675 100644
+--- a/spirv_module.hpp
++++ b/spirv_module.hpp
+@@ -87,6 +87,8 @@ enum class HelperCall
+ 	CoopMatTransfer,
+ 	CoopMatSaturationFixup,
+ 	CoopMatSaturateFP8,
++	CoopMatRoundFP8F32,
++	CoopMatRoundFP8F16,
+ 	ByteAddressMask,
+ 	UDiv,
+ 	UMod,
