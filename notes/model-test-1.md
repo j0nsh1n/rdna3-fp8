@@ -120,6 +120,25 @@ Results:
   -ub 2048 FP8 9213-9225 vs Q8_0 7563-7657 (+20 %). FP8 as shipped (BF16 output layer) 8363-9201.
 - Real prompts (notes/prompt-test-1.md) give byte-identical replies to before.
 
+## GPU memory
+
+`llama-completion -c 4096 -f <4.5 KB prompt> -n 32 -v`, device 0 only; peak from the driver
+(`/sys/class/drm/card1/device/mem_info_vram_used`, sampled every 50 ms) minus the idle level right before the run
+(desktop and other processes share the card). Logs: `build/vram/`.
+
+| Model | GPU model buffer (llama.cpp) | Peak used by the run |
+|---|---|---|
+| FP8, Q8_0 output layer | 3088 MiB | 4175 MiB |
+| Q8_0 | 3256 MiB | 4369 MiB |
+| FP8 as shipped (BF16 output layer) | 3440 MiB | 4533 MiB |
+| F16 | 6128 MiB | 7280 MiB |
+
+All four: KV cache 448 MiB, GPU compute buffer 279 MiB; the token embedding stays in host memory (CPU_Mapped 751 MiB
+for BF16, 399 MiB for Q8_0). The rest of the peak (about 0.36-0.39 GB, runtime overhead) is the same for FP8 and
+Q8_0, so the patched FP8 prompt path needs no extra temporary buffers (the scale-folding path allocated an F16 copy of
+each weight as it went). FP8 saves 1/17 of the quantized weight bytes against Q8_0 (1 byte per weight instead of
+1.0625), about 5 % of the model buffer here.
+
 ## Open
 
 - Eight parallel sequences: 10 % behind Q8_0 in this model (ahead on the big weight).
