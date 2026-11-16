@@ -1,6 +1,6 @@
-// Drop-in for clean/kernels/wg_platform.h on gfx11 (RDNA 3, no hardware FP8 conversion): software FP32 -> E4M3
-// that is bit-exact with the repo's wg_f32_to_e4m3 (round to nearest even, saturating at +-448, NaN -> sign|0x7f,
-// FP32 denormals -> signed zero), checked over all 2^32 inputs (RESULTS.md), plus the same rounding delivered as F16
+// Software FP32 -> E4M3 for gfx11 (RDNA 3, no hardware FP8 conversion), bit-exact with a reference converter
+// (round to nearest even, saturating at +-448, NaN -> sign|0x7f, FP32 denormals -> signed zero), checked over all
+// 2^32 inputs (measurements/e4m3-rounding.md), plus the same rounding delivered as F16
 // bits for the next F16 matrix operand. Uses WG_FN, u32, v2i, v8f, v8h from wg_platform.h.
 //
 // Method: with z = |x| clamped to [2^-6, 448] and C = 1.5 * 2^(E+20) (E = exponent of z), the FP32 add |x| + C rounds

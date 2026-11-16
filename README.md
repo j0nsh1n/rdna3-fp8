@@ -39,7 +39,6 @@ Status: research on one GPU and two models. Nothing has been sent to llama.cpp, 
   divergence near 0 means the outputs match a reference almost exactly.
 - **FSR 4:** AMD's AI upscaler for games, whose neural network uses FP8. On Linux it reaches RDNA 3 through
   vkd3d-proton (DirectX 12 on Vulkan) and its shader translator dxil-spirv, which emulate the FP8 instructions.
-- **WrongGPU:** an earlier project of mine that measured RDNA 3's instructions; the measurements here come from it.
 
 ## The state of FP8 on RDNA 3
 
@@ -64,8 +63,7 @@ limits stay.
 ## Architecture limitations
 
 MEASURED means I (or the agents under my direction) saw it in a run on the 7900 XT. INFERRED means reasoned from
-measurements. The instruction measurements come from the WrongGPU project, see [Licence and credits](#licence-and-credits).
-Full tables are in [measurements/](measurements/).
+measurements. Full tables are in [measurements/](measurements/).
 
 ### No FP8 instructions
 
@@ -461,8 +459,6 @@ the numbers as measurements from one machine, and read the patches before relyin
 MIT, see [LICENSE](LICENSE). Copyright (c) 2026 j0nsh1n.
 
 - The patches apply to llama.cpp (MIT) and dxil-spirv (MIT). Those projects keep their own licences.
-- `measurements/` and `examples/quant/e4m3_rdna3.h` come from the WrongGPU project (MIT,
-  https://github.com/phantoslayer21/wronggpu).
 - Models are not included. I used `RedHatAI/Llama-3.2-3B-Instruct-FP8` and `RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8`,
   under the Llama community licences.
 - The idea of widening FP8 weights to FP16 inside a matrix kernel is not new. FP8 Marlin (vLLM) does it on NVIDIA Ampere,

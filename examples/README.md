@@ -105,7 +105,7 @@ python3 -I tools/loop_isa.py <file.s> [kernel-name-regex]
 
 ## quant/e4m3_rdna3.h
 
-Exact FP32 to E4M3 rounding without FP8 hardware, from the WrongGPU project. Round to nearest even, saturate at 448,
-bit-exact over all 2^32 inputs. It is written against that project's `wg_platform.h` types (`WG_FN`, `u32`, `v2i`, `v8f`,
-`v8h`), so it does not compile on its own. Read it for the method (the magic-constant add and subtract) and port it, or
+Exact FP32 to E4M3 rounding without FP8 hardware. Round to nearest even, saturate at 448, bit-exact over all 2^32
+inputs. It expects a small platform header (`wg_platform.h`, not included) that defines `WG_FN`, `u32`, `v2i`, `v8f` and
+`v8h`, so it does not compile on its own. Read it for the method (the magic-constant add and subtract) and port it, or
 see [../measurements/e4m3-rounding.md](../measurements/e4m3-rounding.md) for the results and the variants that failed.

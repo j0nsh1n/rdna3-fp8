@@ -10,6 +10,5 @@ on a Radeon RX 7900 XT (gfx1100).
 | [shader-throughput.md](shader-throughput.md) | Cost per value of widening, rounding and lookup operations in shaders. |
 | [e4m3-rounding.md](e4m3-rounding.md) | Exact FP32 to E4M3 rounding without FP8 hardware, with the variants that failed. |
 
-These files come from the WrongGPU project (MIT, https://github.com/phantoslayer21/wronggpu) and are copied
-unchanged. File paths inside them (`run.sh`, `out/`, `logs/`, `shaders/` and similar) point to that project's lab
-folders, which are not part of this repository.
+These are the raw measurement notes. File paths inside them (`run.sh`, `out/`, `logs/`, `shaders/` and similar) and
+the phrase "the repo" refer to the lab setup the measurements were run in, which is not part of this repository.

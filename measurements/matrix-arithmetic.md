@@ -346,7 +346,7 @@ Files: `results/<class>.npz` (inputs plus the GPU outputs of this card). Keys:
 
 Mathematically D[p, m, n] = C[p, m, n] + sum_k A[p, m, k] * B[p, k, n], with k in the order stored. For gfx12's FP8
 instruction, pack `A8` and `B8` into the gfx12 wave32 fragments: k = 0..7 and 8..15 split across the half-waves as in
-`clean/rr_f/gpu/probe_p1.py` / `rr_probe.hlsl`; WrongGPU's own layout is the gfx12 one. Keep the stored K order. Then
+`clean/rr_f/gpu/probe_p1.py` / `rr_probe.hlsl`; the lab harness's own layout is the gfx12 one. Keep the stored K order. Then
 compare D bit for bit with `D_f32`, and also run `models.py` against the RDNA 4 output (`analyse.py`'s `fit` takes any D
 array). The FP16 classes (`f16_full`) replay through gfx12's `v_wmma_f32_16x16x16_f16` for Model K / FG. Raw
 little-endian `.bin` files with the same layout are in `inputs/` for a C harness.
