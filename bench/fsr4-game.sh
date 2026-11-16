@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Switch Cyberpunk 2077 between WrongGPU's setup and our FSR 4 (FP8 path) test, and back, without leaving traces.
+# Switch Cyberpunk 2077 (OptiScaler under Proton) to our FSR 4 FP8-path test and back, without leaving traces.
+# CYBERPUNK_DIR must point to the game folder (the one that contains bin/x64).
 # Usage: bench/fsr4-game.sh snapshot | use base|exact | restore | status
 #   snapshot   once, game closed: sha256 of every file in bin/x64 (recursive) and the game folder's top level; copies
 #              OptiScaler.ini, d3d12.dll, d3d12core.dll and the vkd3d-proton shader cache aside.
@@ -8,10 +9,14 @@
 #              so shaders compiled under another DXIL_SPIRV_CONFIG are not reused. The FP8 mode itself is chosen by the
 #              Steam launch option DXIL_SPIRV_CONFIG=wmma_rdna3_workaround | wmma_rdna3_exact_fp8 | wmma_rdna3_exact_fp8_rte.
 #   restore    copies the saved files back, removes files that were not in the snapshot, and checks every hash.
-# Rules agreed with the WrongGPU project: never touch wronggpu-setup/, the WrongGPU runtime, its ini files or plugins.
+# Only OptiScaler.ini, d3d12.dll, d3d12core.dll, the vkd3d-proton shader cache and log files are changed or restored;
+# everything else in the game folder is left alone and checked against the snapshot.
 set -euo pipefail
 
-GAME="/var/mnt/games/SteamLibrary/steamapps/common/Cyberpunk 2077"
+# Machine-specific settings (GPU_LOCK, CYBERPUNK_DIR) may live in build/local.env, which git ignores.
+LOCAL_ENV="$(cd "$(dirname "$0")/.." && pwd)/build/local.env"
+[[ -f "$LOCAL_ENV" ]] && source "$LOCAL_ENV"
+GAME="${CYBERPUNK_DIR:?set CYBERPUNK_DIR to the Cyberpunk 2077 folder}"
 BIN="$GAME/bin/x64"
 HERE="$(cd "$(dirname "$0")/.." && pwd)/build/fsr4"
 SAVE="$HERE/game-backup"
@@ -38,7 +43,7 @@ snapshot)
     hash_list > "$SAVE/hashes-before.txt"
     cp -p "$BIN/OptiScaler.ini" "$BIN/d3d12.dll" "$BIN/d3d12core.dll" "$SAVE/"
     for c in "$GAME"/vkd3d-proton.cache*; do [[ -f $c ]] && cp -p "$c" "$SAVE/"; done
-    # OptiScaler and WrongGPU rewrite their logs on every launch
+    # mods rewrite their logs on every launch
     mkdir -p "$SAVE/logs"
     for l in "$BIN"/*.log "$BIN"/*.log.*; do [[ -f $l ]] && cp -p "$l" "$SAVE/logs/"; done
     echo "snapshot: $(wc -l < "$SAVE/hashes-before.txt") files hashed; saved $(ls "$SAVE" | grep -v hashes | tr '\n' ' ')"

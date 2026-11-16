@@ -6,7 +6,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LOCK=/home/jonathans/Projects/wronggpu/build/rdna3-analysis/gpu-bench.lock
+# Machine-specific settings (GPU_LOCK, CYBERPUNK_DIR) may live in build/local.env, which git ignores.
+[[ -f "$ROOT/build/local.env" ]] && source "$ROOT/build/local.env"
+# GPU_LOCK: a lock file shared with any other job that times things on the same GPU (default: one inside build/).
+LOCK="${GPU_LOCK:-$ROOT/build/gpu-bench.lock}"
 PATCHED="$ROOT/build/llama.cpp/build-hip/bin"
 BASE="$ROOT/build/llama.cpp-base/build-hip/bin"
 # MODEL selects the GGUF set: models/<MODEL>-{auto,fp8-outq8,q8_0,f16}.gguf (default llama32-3b). Missing files are skipped.

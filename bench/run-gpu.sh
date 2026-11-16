@@ -4,13 +4,16 @@
 # (default: build correct baseline decode prefill). llama times the patched llama.cpp FP8 decode against Q8_0.
 # Logs go to build/runs/<timestamp>/, one file per phase plus summary.txt.
 #
-# Every timed command takes the shared GPU lock on its own, so the WrongGPU project's runs get turns between ours.
+# Every timed command takes the GPU lock on its own, so other GPU jobs sharing the lock get turns between ours.
 # Untimed correctness runs skip the lock (short, and overlap only disturbs timings).
 # Memory: stop if available memory falls below 3 GB; timed runs wait for 8 GB (machine rules).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LOCK=/home/jonathans/Projects/wronggpu/build/rdna3-analysis/gpu-bench.lock
+# Machine-specific settings (GPU_LOCK, CYBERPUNK_DIR) may live in build/local.env, which git ignores.
+[[ -f "$ROOT/build/local.env" ]] && source "$ROOT/build/local.env"
+# GPU_LOCK: a lock file shared with any other job that times things on the same GPU (default: one inside build/).
+LOCK="${GPU_LOCK:-$ROOT/build/gpu-bench.lock}"
 GEMV="$ROOT/build/gemv/fp8_gemv"
 GEMM="$ROOT/build/gemm/fp8_gemm"
 TBO="$ROOT/build/llama.cpp/build-hip/bin/test-backend-ops"
