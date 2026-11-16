@@ -1,5 +1,233 @@
+diff --git a/ggml/src/ggml-cuda/fp8.cu b/ggml/src/ggml-cuda/fp8.cu
+index 5fdec4220..c78bbb5ad 100644
+--- a/ggml/src/ggml-cuda/fp8.cu
++++ b/ggml/src/ggml-cuda/fp8.cu
+@@ -204,3 +204,209 @@ bool ggml_cuda_mul_mat_fp8(
+ }
+ 
+ #endif
++
++#if defined(GGML_USE_HIP)
++
++// Tile: 128 weight rows x 128 columns x 64 K, 8 warps (4 along rows, 2 along columns), one LDS buffer.
++namespace fp8_wmma {
++constexpr int BM = 128, BN = 128, BK = 64, WAM = 4, WAN = 2, PAD = 8;
++constexpr int NT = WAM*WAN*32;
++constexpr int WM = BM/WAM, WN = BN/WAN;
++constexpr int TM = WM/16,  TN = WN/16;
++constexpr int S  = BK + PAD;         // halves per LDS row
++constexpr int CA = BK/16, CB = BK/8;  // 16-byte weight chunks, 8-value activation chunks per row
++constexpr int SA = BM*CA/NT, SB = BN*CB/NT;
++constexpr int RA = NT/CA, RB = NT/CB;
++static_assert(BM*CA % NT == 0 && BN*CB % NT == 0, "staging does not divide");
++}
++
++typedef _Float16 fp8_half16_t __attribute__((ext_vector_type(16)));
++typedef float    fp8_float8_t __attribute__((ext_vector_type(8)));
++typedef uint32_t fp8_u32x4_t  __attribute__((ext_vector_type(4)));
++typedef uint32_t fp8_u32x8_t  __attribute__((ext_vector_type(8), aligned(16)));
++
++// E4M3 bits shifted into F16 position give the value * 2^-8 exactly; even = bytes (0, 2), odd = bytes (1, 3).
++static __device__ __forceinline__ uint32_t fp8_widen_even(const uint32_t x) {
++    return ((x << 8) & 0x80008000u) | ((x << 7) & 0x3F803F80u);
++}
++
++static __device__ __forceinline__ uint32_t fp8_widen_odd(const uint32_t x) {
++    return (x & 0x80008000u) | ((x >> 1) & 0x3F803F80u);
++}
++
++// Non-zero if a byte is a NaN code (0x7F or 0xFF).
++static __device__ __forceinline__ uint32_t fp8_nan_bytes(const uint32_t x) {
++    return ((x & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u;
++}
++
++static __device__ __forceinline__ uint32_t fp8_pack_half2(const float a, const float b) {
++    const half2 h = __floats2half2_rn(a, b);
++    return *(const uint32_t *) &h;
++}
++
++static __device__ __forceinline__ fp8_half16_t fp8_lds_frag(const uint32_t * p) {
++    return __builtin_bit_cast(fp8_half16_t, *(const fp8_u32x8_t *) p);
++}
++
++// dst[n][m] = scale * sum_k w[m][k] * y[n][k]. Activations are rounded to F16 while staging, in the same pair order as
++// the widened weights (k0, k2, k1, k3), which leaves the dot products unchanged. WMMA takes the activations as A and the
++// weights as B, so each accumulator lane runs along m and the stores are contiguous.
++static __global__ void __launch_bounds__(fp8_wmma::NT) mul_mat_fp8_wmma(
++        const uint8_t * __restrict__ w, const float * __restrict__ y, float * __restrict__ dst, const float * __restrict__ scale,
++        const int M, const int N, const int K) {
++#if defined(RDNA3)
++    using namespace fp8_wmma;
++    __shared__ uint32_t sa[BM*S/2];
++    __shared__ uint32_t sb[BN*S/2];
++    __shared__ uint32_t row_nan[BM];
++
++    const int m0   = blockIdx.x*BM;
++    const int n0   = blockIdx.y*BN;
++    const int tid  = threadIdx.x;
++    const int wave = tid/32;
++    const int lane = tid%32;
++    const int wm0  = (wave % WAM)*WM;
++    const int wn0  = (wave / WAM)*WN;
++
++    const int arow0 = tid/CA;
++    const uint8_t * wbase = w + int64_t(m0 + arow0)*K + (tid % CA)*16;
++    uint32_t * adst0 = sa + (arow0*S + (tid % CA)*16)/2;
++    const float * ybase[SB];
++#pragma unroll
++    for (int i = 0; i < SB; ++i) {
++        // columns past N read the last column; their results are not stored
++        ybase[i] = y + int64_t(min(n0 + tid/CB + i*RB, N - 1))*K + (tid % CB)*8;
++    }
++    uint32_t * bdst0 = sb + ((tid/CB)*S + (tid % CB)*8)/2;
++    for (int i = tid; i < BM; i += NT) {
++        row_nan[i] = 0;
++    }
++
++    fp8_float8_t acc[TN][TM] = {};
++    uint32_t     nanf[SA]    = {0};
++    fp8_u32x4_t  wv[SA];
++    float4       yv[2*SB];
++
++    auto load = [&](const int k) {
++#pragma unroll
++        for (int i = 0; i < SA; ++i) {
++            wv[i] = *(const fp8_u32x4_t *) (wbase + int64_t(i*RA)*K + k);
++        }
++#pragma unroll
++        for (int i = 0; i < SB; ++i) {
++            const float4 * src = (const float4 *) (ybase[i] + k);
++            yv[2*i]     = src[0];
++            yv[2*i + 1] = src[1];
++        }
++    };
++    auto stage = [&]() {
++#pragma unroll
++        for (int i = 0; i < SA; ++i) {
++            fp8_u32x4_t * ad = (fp8_u32x4_t *) (adst0 + i*(RA*S/2));
++            nanf[i] |= fp8_nan_bytes(wv[i].x) | fp8_nan_bytes(wv[i].y) | fp8_nan_bytes(wv[i].z) | fp8_nan_bytes(wv[i].w);
++            ad[0] = fp8_u32x4_t{fp8_widen_even(wv[i].x), fp8_widen_odd(wv[i].x), fp8_widen_even(wv[i].y), fp8_widen_odd(wv[i].y)};
++            ad[1] = fp8_u32x4_t{fp8_widen_even(wv[i].z), fp8_widen_odd(wv[i].z), fp8_widen_even(wv[i].w), fp8_widen_odd(wv[i].w)};
++        }
++#pragma unroll
++        for (int i = 0; i < SB; ++i) {
++            const float4 g0 = yv[2*i];
++            const float4 g1 = yv[2*i + 1];
++            *(fp8_u32x4_t *) (bdst0 + i*(RB*S/2)) = fp8_u32x4_t{
++                fp8_pack_half2(g0.x, g0.z), fp8_pack_half2(g0.y, g0.w), fp8_pack_half2(g1.x, g1.z), fp8_pack_half2(g1.y, g1.w)};
++        }
++    };
++    auto compute = [&]() {
++#pragma unroll
++        for (int kk = 0; kk < BK; kk += 16) {
++            fp8_half16_t wf[TM];
++            fp8_half16_t yf[TN];
++#pragma unroll
++            for (int b = 0; b < TM; ++b) {
++                wf[b] = fp8_lds_frag(sa + ((wm0 + b*16 + lane % 16)*S + kk)/2);
++            }
++#pragma unroll
++            for (int a = 0; a < TN; ++a) {
++                yf[a] = fp8_lds_frag(sb + ((wn0 + a*16 + lane % 16)*S + kk)/2);
++            }
++#pragma unroll
++            for (int a = 0; a < TN; ++a) {
++#pragma unroll
++                for (int b = 0; b < TM; ++b) {
++                    acc[a][b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(yf[a], wf[b], acc[a][b]);
++                }
++            }
++        }
++    };
++
++    load(0);
++    for (int k = 0; k < K; k += BK) {
++        stage();
++        __syncthreads();
++        if (k + BK < K) {
++            load(k + BK);
++        }
++        compute();
++        __syncthreads();
++    }
++
++#pragma unroll
++    for (int i = 0; i < SA; ++i) {
++        atomicOr(&row_nan[arow0 + i*RA], nanf[i]);
++    }
++    __syncthreads();
++
++    const float s = 256.0f * *scale;
++#pragma unroll
++    for (int b = 0; b < TM; ++b) {
++        const int  ml       = wm0 + b*16 + lane % 16;
++        const bool nan_row  = row_nan[ml] != 0;
++#pragma unroll
++        for (int a = 0; a < TN; ++a) {
++#pragma unroll
++            for (int e = 0; e < 8; ++e) {
++                const int n = n0 + wn0 + a*16 + 2*e + lane/16;
++                if (n < N) {
++                    dst[int64_t(n)*M + m0 + ml] = nan_row ? NAN : s*acc[a][b][e];
++                }
++            }
++        }
++    }
++#else
++    GGML_UNUSED_VARS(w, y, dst, scale, M, N, K);
++    NO_DEVICE_CODE;
++#endif // defined(RDNA3)
++}
++
++bool ggml_cuda_mul_mat_fp8_wmma(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++        const ggml_tensor * weight_scale) {
++    using namespace fp8_wmma;
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    if (!GGML_CUDA_CC_IS_RDNA3(cc) || src0->type != GGML_TYPE_F8_E4M3 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++            !weight_scale || weight_scale->type != GGML_TYPE_F32 || ggml_nelements(weight_scale) != 1 ||
++            !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
++            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
++            src0->ne[0] % BK != 0 || src0->ne[1] % BM != 0 || src1->ne[1] <= 8 ||
++            !ggml_cuda_is_aligned(src0, 16) || !ggml_cuda_is_aligned(src1, 16)) {
++        return false;
++    }
++    const int M = src0->ne[1];
++    const int K = src0->ne[0];
++    const int N = src1->ne[1];
++    const dim3 block_nums(M/BM, (N + BN - 1)/BN, 1);
++    mul_mat_fp8_wmma<<<block_nums, NT, 0, ctx.stream()>>>(
++        (const uint8_t *) src0->data, (const float *) src1->data, (float *) dst->data, (const float *) weight_scale->data, M, N, K);
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
++#else
++
++bool ggml_cuda_mul_mat_fp8_wmma(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++        const ggml_tensor * weight_scale) {
++    GGML_UNUSED_VARS(ctx, src0, src1, dst, weight_scale);
++    return false;
++}
++
++#endif // defined(GGML_USE_HIP)
+diff --git a/ggml/src/ggml-cuda/fp8.cuh b/ggml/src/ggml-cuda/fp8.cuh
+index 069349ed9..0f692838f 100644
+--- a/ggml/src/ggml-cuda/fp8.cuh
++++ b/ggml/src/ggml-cuda/fp8.cuh
+@@ -5,3 +5,9 @@
+ bool ggml_cuda_mul_mat_fp8(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+         const ggml_tensor * weight_scale = nullptr);
++
++// HIP/RDNA 3 only: FP8 x F32 matmul with WMMA for more than 8 columns, the per-tensor scale applied in the epilogue.
++// Returns false if the shape, layout or GPU does not fit.
++bool ggml_cuda_mul_mat_fp8_wmma(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++        const ggml_tensor * weight_scale);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 540c53614..567207986 100644
+index 540c53614..b06df472d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1931,7 +1931,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
@@ -13,7 +241,7 @@ index 540c53614..567207986 100644
      } else if (compute_type == GGML_TYPE_BF16) {
          prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_RDNA4_M(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
      }
-@@ -2122,6 +2124,55 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+@@ -2122,6 +2124,58 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
      }
  }
  
@@ -47,6 +275,9 @@ index 540c53614..567207986 100644
 +            !ggml_cuda_is_aligned(src0, 4) || !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
 +        return false;
 +    }
++    if (ggml_cuda_mul_mat_fp8_wmma(ctx, src0, src1, dst, scale)) {
++        return true;
++    }
 +    const int64_t ne = ggml_nelements(src0);
 +    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ne);
 +    const int64_t n4 = ne/4;
@@ -69,7 +300,7 @@ index 540c53614..567207986 100644
  static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                            const ggml_tensor * ffn_gate,
                                            const ggml_tensor * glu,
-@@ -5018,6 +5069,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5018,6 +5072,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                      ggml_cuda_mul_mat_fp8(*cuda_ctx, src0, src1, scale_node, scale)) {
                  return 1;
              }

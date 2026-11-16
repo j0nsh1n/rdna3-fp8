@@ -95,8 +95,34 @@ Larger prompt chunks reduce the conversion share (pp2048, t/s, 2 rounds x 3): FP
 the gap is the F16 hipBLAS path itself being a few percent slower than Q8_0's MMQ kernel on this card (the F16 model
 shows the same).
 
+## Prompt processing with a dedicated FP8 kernel (done)
+
+A Sonnet worker tuned the WMMA prototype (`proto/gemm/fp8_gemm.hip`, configurable `gemm_t` with about 50 variants and
+a hipBLAS baseline in the same harness; build with `-lhipblas`) until the machine ran out of memory (a browser tab,
+not this project). Its best general configuration, re-timed by the lead at N = 512 (2 rounds, us): 8192 x 3072
+hipBLAS F16 512-534 vs ours 355-357; 3072 x 3072 156-157 vs 152-154; 1024 x 3072 60-62 vs 66-68; 3072 x 8192
+393-395 vs 388-391 (ours without activation conversion; with it built in, +5-20 us).
+
+The patch now carries a clean single-configuration version, `mul_mat_fp8_wmma` in `fp8.cu` (RDNA 3 only, `#if
+defined(RDNA3)`): tile 128 x 128 x 64, 8 warps (4 x 2), one LDS buffer, E4M3 widened to F16 while staging, F32
+activations rounded to F16 while staging (no separate pass), F32 accumulation in WMMA, activations as the A operand so
+stores are contiguous, columns past N clamped on load, NaN rows as before, scale read from the scale tensor in the
+epilogue. Its compiled loop matches the prototype's (291 vs 290 instructions, 182 VALU, 56 LDS ops, 186 VGPRs, no
+spills, 37 KB LDS). It runs at the MUL_MAT + scale fusion hook for more than 8 columns when M % 128 == 0, K % 64 == 0
+and tensors are contiguous and 16-byte aligned; anything else falls back to the scale-folding F16 path, then to the
+F32-output fallback.
+
+Results:
+- `test-backend-ops test -b ROCm0 -p f8_e4m3`: 450/450 OK.
+- KL divergence at 512-token chunks against unmodified llama.cpp's F32 decode path: 0.000153 (max 0.0021), from
+  0.001076 (max 0.222) with scale folding; Q8_0 0.000605. Perplexity (50 chunks) 9.4626.
+- Prompt speed (`llama-bench`, 2 rounds x 3, t/s): pp512 FP8 8545-8962 vs Q8_0 7660-7678 (+12-17 %); pp2048 with
+  -ub 2048 FP8 9213-9225 vs Q8_0 7563-7657 (+20 %). FP8 as shipped (BF16 output layer) 8363-9201.
+- Real prompts (notes/prompt-test-1.md) give byte-identical replies to before.
+
 ## Open
 
 - Eight parallel sequences: 10 % behind Q8_0 in this model (ahead on the big weight).
-- Prompt processing: 9-13 % behind Q8_0 (conversion per chunk plus the F16 hipBLAS path); see the section above.
+- Prompt kernel: one tile configuration for all shapes; the small K/V layer (1024 x 3072) is still about 10 % behind
+  hipBLAS in isolation. Per-shape configurations or split-K could close that.
 - Not yet done: an actual generation test with a real prompt (owner asked for it after the tuning).
