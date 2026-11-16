@@ -196,3 +196,74 @@ packed in the same order; a dot product does not care.
 - No independent review of the llama.cpp patch yet (offered to the owner).
 - Untested: other models and sizes, RDNA 4 (the WMMA kernel is RDNA 3 only by design; RDNA 4 has native FP8 and a
   different WMMA layout), MUL_MAT_ID (MoE) shapes, Vulkan.
+
+## 12. Update, later on 2026-11-15
+
+### 12.1 FSR 4's FP8 path on RDNA 3 (dxil-spirv `wmma_rdna3_workaround`): what it really computes
+
+Read in dxil-spirv 114e664 (pinned by vkd3d-proton 5b1089c8), `opcodes/dxil/dxil_ags.cpp` and `spirv_module.cpp`:
+
+- Without native FP8 (`wmma_fp8` off), FP8 matrices are held as F16 coopmats.
+- Where RDNA 4 converts an F32 accumulator to FP8 with saturation (`v_cvt_pk_fp8_f32`), the workaround does an
+  `OpFConvert` F32 -> F16 under a forced `RoundingModeRTZ` for 16-bit (set shader-wide for every WMMA shader on RDNA 3,
+  `dxil_converter.cpp`, comment "FP16 RTZ allows faster conversions"), then `CoopMatSaturateFP8`, which only clamps to
+  +-448 (`NClamp`). There is no rounding to the E4M3 grid: values passed between FSR 4's layers keep F16 precision
+  (11 bits) where RDNA 4 keeps 4. So the RDNA 3 emulation computes a different (more precise) network than the one AMD
+  ships for RDNA 4, not an approximation of it.
+- FP8 loads (`build_packed_fp8_to_fp16_vec4`) already use the shift trick (sign-extend, << 7, clear bit 14, x256 in F16):
+  exact.
+- FP8 stores to memory (`build_fp16_to_fp8`) round "to nearest, ties to 0" from F16 (the code says so); exact only for
+  values already on the E4M3 grid.
+
+### 12.2 Patch: exact FP8 rounding option for dxil-spirv (not yet tested in a game)
+
+`bench/dxil-spirv-rdna3-exact-fp8.patch` (on dxil-spirv 114e664, 5 files, about 200 lines). New `DXIL_SPIRV_CONFIG`
+values (each implies `wmma_rdna3_workaround`):
+- `wmma_rdna3_exact_fp8`: where an F32 source becomes FP8 with saturation, a new `CoopMatRoundFP8F32` helper rounds each
+  element to the E4M3 grid in F32 first (the carry-over magic-constant method: C = 1.5 * 2^(E+20) from
+  clamp(|x|, 2^-6, 448), (|x| + C) - C with `NoContraction` on both ops, clamp to [0, 448], NaN kept, sign restored),
+  then the F16 conversion is exact. F16 sources use `CoopMatRoundFP8F16` instead of the clamp-only helper.
+- `wmma_rdna3_exact_fp8_rte`: the same, without forcing RTZ for F16, so the rest of FSR 4's F16 math rounds as on RDNA 4.
+- Option unset or `wmma_rdna3_workaround`: output unchanged.
+
+Checks (MEASURED, dxil-spirv's own `test_shaders.py`, `--subfolder ags`, DXC v1.10.2605.24 from your toolchains folder,
+run in scratch copies): with the option off all 30 AGS shaders match the stored references; all 30 validate in the
+workaround, exact and exact_rte modes; only `cs_wmma_fp32_fp8_conversions.sm66.ssbo.nv-coopmat2` differs between
+workaround and exact (the `--full-wmma 0 1` route, which should be the RDNA 3 + RADV route; to be confirmed in game).
+A first version produced invalid SPIR-V (an `OpSelect` used an `OpIsNan` emitted after it); fixed and revalidated.
+Constants and decorations checked in the disassembly. Expected effect: FSR 4 output much closer to RDNA 4's (not
+bit-identical: RDNA 3's F16 WMMA sums mixed signs slightly differently, per your carry-over measurements), probably a
+little slower.
+
+Built (no changes to your trees): our own vkd3d-proton 5b1089c8 + that dxil-spirv in
+`/home/jonathans/Projects/rdna3-fp8/build/fsr4/` (DLLs in `dlls/base` and `dlls/exact`), with extended emulation, using
+your `toolchains/llvm-mingw-20261104` and `toolchains/glslang-16.6.0` read-only and meson 1.7.2 via `uv tool run`.
+
+### 12.3 Cyberpunk: switch script, one round trip done with the game closed
+
+`bench/fsr4-game.sh snapshot | use base|exact | restore | status` follows your rules: hashes every file in `bin/x64`
+(recursive) and the game folder's top level, saves OptiScaler.ini, d3d12.dll, d3d12core.dll, the vkd3d-proton cache
+and the logs (OptiScaler.log, wronggpu-rr.log*), sets only `Dx12Upscaler = ffx` and `Fsr4GpuSupport = 1`, clears the
+shader cache per variant, refuses while the game runs, and restores with a full hash check. One round trip
+(snapshot -> use exact -> restore) ran with the game closed: all 139 files match the snapshot; your d3d12core.dll
+(78f2e60a...) and OptiScaler.ini (Dx12Upscaler = WrongGPU, Fsr4GpuSupport = 2) are back. The backup and hash list are
+in `build/fsr4/game-backup/`. No in-game run has happened yet; the owner will schedule it.
+
+### 12.4 Llama 3.1 8B FP8 in llama.cpp (`notes/model-test-8b.md`)
+
+Patched FP8 vs Q8_0: one stream +7 % (81.9 vs 76.3 t/s), prompts +17 % (4049 vs 3470 t/s), 2-7 parallel streams
++1 to +7 %, 8 streams -8 % (a worker is on that). Unmodified llama.cpp: 30 t/s and NaN on prompts. Decode KLD vs
+llama.cpp's exact path 0.000002-0.000005. The RedHatAI 8B checkpoint is `naive-quantized`; llama.cpp's converter
+asserts on it although it stores the same FP8 weights and one-element scales; one-line fix in
+`bench/llama-cpp-convert-naive-fp8.patch`.
+
+### 12.5 Two machine notes
+
+- Out-of-memory kills (two agents today): one browser tab used 11.2 GB; separately, `llama-completion` without `-c`
+  sizes the context to free VRAM (89,344 tokens for 8B, about 11 GB of KV cache) on a machine whose swap was full.
+  Always pass a context size for model runs.
+- llama.cpp bug fact sheet (`notes/llama-cpp-bug-draft.md`): the FP8 NaN is the same F16-overflow mechanism as open
+  issue ggml-org/llama.cpp#30951 (other types, CUDA); master 9fba51d2 still has the code. llama.cpp's CONTRIBUTING
+  forbids AI-written bug reports, so the owner files it in their own words.
+
+Private repo with all of this: https://github.com/j0nsh1n/rdna3-fp8.
