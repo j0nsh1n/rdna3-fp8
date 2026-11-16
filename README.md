@@ -147,6 +147,23 @@ All three cost me real time. Each was caught by counting instructions in the ass
   banks and HIP gives no control over that. Also `__builtin_nontemporal_load` needs a native `ext_vector_type`, not HIP's
   `uint4`.
 
+### Findings beyond FP8 arithmetic: kernels and drivers
+
+A second workload on the same card (the convolution and transformer kernels of an image-upscaling network, in HIP and
+in D3D12 under Proton) turned up findings that are not about FP8 rounding. Details, research steps and sources are in
+[measurements/kernels-and-drivers.md](measurements/kernels-and-drivers.md).
+
+- On gfx11 the compiler can move a `v_wmma` chain under a per-lane mask. The result is NaN or wrong values on partly valid
+  tiles, which a CPU emulator cannot show. Fixed in the source, with a scan of the disassembly that finds every such site.
+- `v_permlanex16` with the fetch-inactive bit set reads the register of a switched-off lane (MEASURED, five mask shapes).
+- F16 matrix ops through D3D12 under Proton (vkd3d-proton, dxil-spirv, RADV) equal the HIP instruction bit for bit. The
+  raw fragment needs a replicated lane layout and covers only K = 0..7 per op.
+- Headless Wine needs its null graphics driver and a scratch `XDG_RUNTIME_DIR`. Under Wine and Proton the
+  physical-adapter-ids query of `D3DKMTQueryAdapterInfo` is not implemented.
+- Unchanged RDNA 4 FP8 shaders run on RDNA 3 when dxil-spirv emulates FP8 on raw fragments. About 70 % of the cost is FP8
+  decode; a prototype with shift widening and one full-size matrix op cut a synthetic whole pass from about 32 ms to
+  about 11 ms.
+
 ## Workarounds
 
 ### a. E4M3 to FP16 by bit shifts
