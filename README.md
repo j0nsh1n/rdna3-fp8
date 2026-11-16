@@ -50,7 +50,7 @@ the software involved is built for newer hardware first, and FP8 on RDNA 3 is a 
 | No FP8 instructions in the vector units or in WMMA | AMD (hardware) | AMD's precision table lists FP8 as supported on RDNA 4 and CDNA, not on RDNA 3. Nothing to fix here, only to work around. |
 | FSR 4 is officially RDNA 4 only | AMD | As far as I know, FSR 4 runs on RDNA 3 only through community translation layers (vkd3d-proton and dxil-spirv). |
 | FP8 decode is slow | llama.cpp | The HIP path converts one byte at a time in software. At batch 1 it reads 214 GB/s of weights, 28 % of the 754 GB/s the card can read. Q8_0 reaches 721 GB/s, F16 739 GB/s. |
-| FP8 models give NaN on prompts | llama.cpp | For more than 8 tokens at once, llama.cpp converts FP8 weights to FP16 and asks hipBLAS for FP16 output. The result overflows (INFERRED; forcing FP32 output removes the NaN). Section [Avoiding the FP16 overflow](#e-avoiding-the-fp16-overflow). |
+| FP8 models give NaN on prompts | llama.cpp | The default is wrong for FP8 on RDNA 3. For more than 8 tokens at once, llama.cpp converts FP8 weights to FP16 and asks hipBLAS for FP16 output, and the result overflows (INFERRED; forcing FP32 output removes the NaN). llama.cpp's own setting `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` already avoids it, but prompts then run at a quarter to a third of Q8_0's speed. Still the case on master `f477c1b90` (2026-11-16). Section [Avoiding the FP16 overflow](#e-avoiding-the-fp16-overflow). |
 | FP8 matmul is refused | PyTorch | `torch._scaled_mm` and FP8 `F.linear` raise on gfx1100. The error names only MI300 and newer for ROCm; PyTorch's architecture list (read, not run) also has RDNA 4. |
 | FP8 only for some checkpoints | llama.cpp | The converter keeps FP8 only when each tensor has one scale. Per-channel and 128-block checkpoints are converted to 16 bit. It also asserts on the compressed-tensors `naive-quantized` variant, which has the same layout. |
 | FSR 4's FP8 path keeps FP16 precision | dxil-spirv (community) | From reading the code: the RDNA 3 emulation converts FP32 to FP16 and clamps to +-448. It never rounds to the FP8 grid. |
@@ -283,6 +283,22 @@ The weights have no NaN codes and the scales are finite. llama.cpp's tests miss 
 uniform in [-1, 1], and the MUL_MAT tolerance (NMSE 5e-4) passes even a 1/256 scale error. I found that by changing the
 scale in my kernel on purpose.
 
+**Retest on current llama.cpp (MEASURED, master `f477c1b90`, 2026-11-16, unmodified, 4 chunks).** The bug is still
+there, and llama.cpp's existing override already avoids it. So the default is wrong for FP8 on RDNA 3; nothing is
+missing.
+
+| Setting | Llama 3.2 3B FP8 | Llama 3.1 8B FP8 |
+|---|---|---|
+| Default | NaN | NaN |
+| `GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F=1` (older name, removed from llama.cpp in July 2026) | NaN | NaN |
+| `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` | 9.7032 | 7.4408 |
+| 8-token batches (reference) | 9.7038 | 7.4407 |
+
+The older setting name is no longer read and gives no warning, so advice that names it no longer helps. The current
+override is correct but slow on prompts: 1906 t/s at 512 tokens on 3B and 1329 t/s on 8B, against 7332 and 3543 for
+Q8_0 on the same build. It does not change generation, which stays at 66.7 t/s on 3B (Q8_0: 148.3) because the FP8
+decode path is slow regardless.
+
 Three fixes, in the patch, in order of preference:
 
 1. The WMMA kernel above (FP32 accumulation, scale in the epilogue). Prompt speed on 3B: 8545-8962 t/s.
@@ -415,7 +431,13 @@ The top token is the same in 99.9 % of positions for decode.
 
 ## Applying it
 
-The patches are written against llama.cpp commit `6d3568e31` (tag b12408). On other commits they may not apply.
+The patches are written against llama.cpp commit `6d3568e31` (tag b12408). They also apply to master `f477c1b90`
+(2026-11-16); on that build the FP8 tests pass (448 of 448) and, against Q8_0, FP8 generation is 10 % faster on 3B and
+8 % on 8B, and 512-token prompts 12 % and 17 % faster (MEASURED, `llama-bench`, 3 repetitions). On other commits they
+may not apply.
+
+Without patching: set `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` to get correct output from FP8 models on RDNA 3. Prompts are
+slow with it (see section e), and generation stays at the unpatched speed.
 
 ```
 git clone https://github.com/ggml-org/llama.cpp
