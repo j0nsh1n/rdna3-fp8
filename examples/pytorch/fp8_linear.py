@@ -1,10 +1,9 @@
-"""FP8 weights in VRAM for PyTorch on gfx1100: a linear layer backed by the decode prototype (proto/gemv/fp8_gemv.hip).
+"""FP8 weights in VRAM for PyTorch on gfx1100: a linear layer backed by the decode prototype (../decode-gemv/fp8_gemv.hip).
 
-Build the library first:
-  hipcc -O3 -std=c++17 --offload-arch=gfx1100 -fPIC -shared proto/torch/fp8_ext.hip -o build/torch-ext/libfp8ext.so \
-      -L/usr/lib64 -lamdhip64
-Run the checks and timings (device 0 must be the RX 7900 XT):
-  build/torch-venv/bin/python -I proto/torch/fp8_linear.py
+Build the library first (from the examples folder):
+  hipcc -O3 -std=c++17 --offload-arch=gfx1100 -fPIC -shared pytorch/fp8_ext.hip -o libfp8ext.so -lamdhip64
+Run the checks and timings (device 0 must be the gfx1100 card):
+  FP8EXT_LIB=$PWD/libfp8ext.so python3 -I pytorch/fp8_linear.py
 Variant a keeps F32 activations (exact, like llama.cpp); variant b rounds activations to FP16 (faster at batch >= 4).
 Batch sizes 1..8 only (decode). The input is converted to F32 and the output back to the input dtype; both count in
 the timings.
@@ -13,19 +12,20 @@ import ctypes
 import os
 import statistics
 import sys
-from pathlib import Path
 
 os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
 import torch  # noqa: E402  (must load PyTorch's HIP runtime before ours so both share it)
 import torch.nn.functional as F  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[2]
-LIB = ctypes.CDLL(str(ROOT / "build/torch-ext/libfp8ext.so"))
+LIB_PATH = os.environ.get("FP8EXT_LIB")
+if not LIB_PATH:
+    sys.exit("set FP8EXT_LIB to the path of libfp8ext.so (build line at the top of this file)")
+LIB = ctypes.CDLL(LIB_PATH)
 LIB.fp8_gemv_run.restype = ctypes.c_int
 LIB.fp8_gemv_run.argtypes = [ctypes.c_char, ctypes.c_int, ctypes.c_int] + [ctypes.c_void_p] * 5 + [
     ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_void_p]
 
-# Best rows per wave from notes/prototype-results-1.md.
+# Best rows per wave, measured with ../decode-gemv/fp8_gemv.hip on an RX 7900 XT.
 BEST_R = {"a": {1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 4, 8: 2},
           "b": {1: 2, 2: 2, 3: 1, 4: 2, 5: 2, 6: 1, 7: 4, 8: 4}}
 

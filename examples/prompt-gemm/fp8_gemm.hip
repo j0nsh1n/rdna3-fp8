@@ -4,9 +4,10 @@
 // widening is paid once per BN columns. Activations are converted to FP16 once per call in the same pair order:
 // within each group of 4 K values the order is k0, k2, k1, k3 for both operands, which leaves the dot product unchanged.
 //
-// Prototype limits: M % 128 == 0, K % 32 == 0; N is padded up to a multiple of BN on the host.
+// Prototype limits: M % 256 == 0, K % 128 == 0 (checked in main; the largest tile variants need it);
+// N is padded up to a multiple of BN on the host.
 // The WMMA output layout used in the store (element i of lane t -> row 2i + t/16 of A, column t%16 of B) is from
-// AMD's RDNA 3 WMMA guide, not yet checked on this card; the CPU comparison below checks it.
+// AMD's RDNA 3 WMMA guide; the CPU comparison below checks it on the card.
 //
 // NaN codes (0x7F, 0xFF) make the whole output row NaN, as in llama.cpp: a per-word check while staging.
 //
@@ -57,7 +58,7 @@ __device__ __forceinline__ uint32_t widen_odd(uint32_t x) {
     return (x & 0x80008000u) | ((x >> 1) & 0x3F803F80u);
 }
 
-// Non-zero exactly when some byte is a NaN code (checked over all 2^32 words by proto/widen_check.cpp).
+// Non-zero exactly when some byte is a NaN code (checked over all 2^32 words by examples/widen-check/widen_check.cpp).
 __device__ __forceinline__ uint32_t nan_bytes(uint32_t x) {
     return ((x & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u;
 }

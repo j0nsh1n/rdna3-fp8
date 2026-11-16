@@ -1,7 +1,7 @@
 // Throwaway prototype: FP8 E4M3 decode GEMV for gfx1100 (RX 7900 XT).
 // Weights stay as bytes [M][K] (row-major, K contiguous, like llama.cpp), activations F32 [N][K], output F32 [N][M].
 // A weight word of four bytes b0..b3 widens to two half2 by bit shifts: even = (b0, b2), odd = (b1, b3), each half
-// equal to the E4M3 value times 2^-8 (checked on the CPU by proto/widen_check.cpp). The 2^8 goes into the scale.
+// equal to the E4M3 value times 2^-8 (checked on the CPU by examples/widen-check/widen_check.cpp). The 2^8 goes into the scale.
 //
 // Variant A (exact): FP32 activations, fma(float(half w), a, acc) -> v_fma_mix_f32. Same products as llama.cpp.
 // Variant B (f16dot): activations converted to FP16 once per call, v_dot2_f32_f16. Half the multiply instructions;
@@ -55,7 +55,7 @@ __device__ __forceinline__ uint32_t widen_odd(uint32_t x) {
     return (x & 0x80008000u) | ((x >> 1) & 0x3F803F80u);
 }
 
-// Non-zero exactly when some byte is a NaN code (checked over all 2^32 words by proto/widen_check.cpp).
+// Non-zero exactly when some byte is a NaN code (checked over all 2^32 words by examples/widen-check/widen_check.cpp).
 __device__ __forceinline__ uint32_t nan_bytes(uint32_t x) {
     return ((x & 0x7F7F7F7Fu) + 0x01010101u) & 0x80808080u;
 }
