@@ -37,8 +37,9 @@ Status: research on one GPU and two models. Nothing has been sent to llama.cpp, 
   memory shared by the threads of one block.
 - **Perplexity, KL divergence:** measures of how much a model's predictions change. Lower perplexity is better; a KL
   divergence near 0 means the outputs match a reference almost exactly.
-- **FSR 4:** AMD's AI upscaler for games, whose neural network uses FP8. On Linux it reaches RDNA 3 through
-  vkd3d-proton (DirectX 12 on Vulkan) and its shader translator dxil-spirv, which emulate the FP8 instructions.
+- **FSR 4:** AMD's AI upscaler for games. On RX 9000 cards its neural network uses FP8. For RX 7000 cards AMD ships a
+  separate INT8 model (since June 2026). The FP8 model can still be run on RDNA 3 on Linux through vkd3d-proton
+  (DirectX 12 on Vulkan) and its shader translator dxil-spirv, which emulate the FP8 instructions.
 
 ## The state of FP8 on RDNA 3
 
@@ -48,7 +49,7 @@ the software involved is built for newer hardware first, and FP8 on RDNA 3 is a 
 | Problem | Owner | What I saw |
 |---|---|---|
 | No FP8 instructions in the vector units or in WMMA | AMD (hardware) | AMD's precision table lists FP8 as supported on RDNA 4 and CDNA, not on RDNA 3. Nothing to fix here, only to work around. |
-| FSR 4 is officially RDNA 4 only | AMD | As far as I know, FSR 4 runs on RDNA 3 only through community translation layers (vkd3d-proton and dxil-spirv). |
+| FSR 4's FP8 model is RDNA 4 only | AMD | AMD ships FSR 4 with a "full FP8" model on RX 9000 and, since FSR SDK 2.3 (June 2026), a separate "full INT8" model on RX 7000 ([AMD, SDK 2.3](https://gpuopen.com/learn/amd-fsr-sdk-2-3-blog/), [SDK 2.4](https://gpuopen.com/learn/amd-fsr-sdk-2-4-rx-6000-ryzen-apus/)). So AMD's own answer for RDNA 3 is a different model, not FP8. The FP8 model runs on RDNA 3 only through community translation layers (vkd3d-proton and dxil-spirv), which emulate the FP8 instructions. |
 | FP8 decode is slow | llama.cpp | The HIP path converts one byte at a time in software. At batch 1 it reads 214 GB/s of weights, 28 % of the 754 GB/s the card can read. Q8_0 reaches 721 GB/s, F16 739 GB/s. |
 | FP8 models give NaN on prompts | llama.cpp | The default is wrong for FP8 on RDNA 3. For more than 8 tokens at once, llama.cpp converts FP8 weights to FP16 and asks hipBLAS for FP16 output, and the result overflows (INFERRED; forcing FP32 output removes the NaN). llama.cpp's own setting `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` is only a workaround: it fixes the NaN, but prompts then run about 3 to 4 times slower than Q8_0 (3.8x on 3B, 2.7x on 8B). Still the case on master `f477c1b90` (2026-11-16). Section [Avoiding the FP16 overflow](#e-avoiding-the-fp16-overflow). |
 | FP8 matmul is refused | PyTorch | `torch._scaled_mm` and FP8 `F.linear` raise on gfx1100. The error names only MI300 and newer for ROCm; PyTorch's architecture list (read, not run) also has RDNA 4. |
@@ -333,7 +334,9 @@ Import torch first and both share PyTorch's copy. Files: [examples/pytorch/](exa
 
 ### g. FSR 4: exact FP8 rounding for dxil-spirv (NOT YET TESTED IN A GAME)
 
-FSR 4 can run on RDNA 3 through vkd3d-proton and dxil-spirv. I read dxil-spirv `114e664` (pinned by vkd3d-proton
+This section is about FSR 4's FP8 model, the one AMD ships for RX 9000 cards. (AMD's official RDNA 3 support, added in
+June 2026, uses a separate INT8 model and does not go through this path.) The FP8 model can run on RDNA 3 through
+vkd3d-proton and dxil-spirv. I read dxil-spirv `114e664` (pinned by vkd3d-proton
 `5b1089c8`). Without native FP8, it holds FP8 matrices as FP16 cooperative matrices. Where RDNA 4 converts an FP32
 accumulator to FP8 with saturation, the RDNA 3 path converts FP32 to FP16 with round-toward-zero and then clamps to
 +-448. It never rounds to the E4M3 grid. So values passed between FSR 4's layers would keep 11 bits of precision where
