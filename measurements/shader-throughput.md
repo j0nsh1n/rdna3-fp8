@@ -112,6 +112,10 @@ products with all 168 SIMDs busy.
   not timed.
 - Ratios (INFERRED from the medians): the matrix instruction is about 2x the best vector path (int8 dot4), 2.3x packed
   FP16 with FP16 accumulation, 4x FP32 FMA and FP16-mix, and 18x int32 multiply-add.
+- These ratios hold for 32-wide waves only, the size every kernel here was run with (section 1). 64-wide waves were not
+  measured on RDNA 3. On RDNA 4 (RX 9070 XT, 2026-11-24) the same comparison changes with the wave size: a 64-wide dot
+  instruction costs the same cycles as a 32-wide one and does twice the lane work, so the matrix lead over int8 dot4
+  drops from 4x to 2x there. Whether RDNA 3's half-rate dot4 behaves the same way in 64-wide waves is open.
 
 ## 4. B: glue around a matrix multiply (MEASURED)
 
