@@ -30,5 +30,9 @@ for b in "$rd"/*/; do
   done
 done
 echo "pp_dpm_sclk after: $(sclk)" >> "$rd/card.log"
-journalctl -k --since "-10min" 2>/dev/null | grep -i -E "ring .* timeout|GPU reset" >> "$rd/card.log" || echo "no ring timeout / GPU reset in kernel log" >> "$rd/card.log"
+if klog=$(journalctl -k --since "-10min" 2>&1); then
+  printf '%s\n' "$klog" | grep -i -E "ring .* timeout|GPU reset" >> "$rd/card.log" || echo "no ring timeout / GPU reset in kernel log" >> "$rd/card.log"
+else
+  echo "WARNING: kernel log could not be read (journalctl -k failed: $(printf '%s' "$klog" | head -n 1)); ring timeout / GPU reset NOT checked" | tee -a "$rd/card.log" >&2
+fi
 exit ${timeouts:-0}

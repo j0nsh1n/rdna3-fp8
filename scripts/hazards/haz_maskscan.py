@@ -2,8 +2,9 @@ r"""Find every matrix instruction (and lane permute) that may run with a partial
 
 Usage: python3 haz_maskscan.py <file.s> [<expect-file>]
 
-On gfx1201 a matrix instruction ignores EXEC (measured, src/study/haz_mask.hip): it reads every lane's operands and
-writes every lane's result. Under a partial EXEC the compiler believes the switched-off lanes are untouched, so their
+Written for gfx1201 (measured in the RDNA 4 study, src/study/haz_mask.hip); also run on gfx1100 against
+src/hazards/haz3_mask.hip. On gfx1201 a matrix instruction ignores EXEC: it reads every lane's
+operands and writes every lane's result. Under a partial EXEC the compiler believes the switched-off lanes are untouched, so their
 operand registers may hold stale values and their result registers get overwritten. This scan finds the sites.
 
 Method: per function, a forward data-flow over the basic blocks of the listing. State: whether EXEC may be partial,
