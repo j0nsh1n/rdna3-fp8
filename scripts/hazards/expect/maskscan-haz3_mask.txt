@@ -1,0 +1,8 @@
+# expectations for scripts/hazards/haz_maskscan.py on src/hazards/haz3_mask.hip (gfx1100); k_sink depends on the compiler
+# and is checked by scan.sh (0 with ROCm 10.1 / 10.2, 1 with the system ROCm 7.1.1 clang 20)
+^k_ifload wmma == 1
+^k_early wmma == 1
+^k_loop wmma == 1
+^k_select wmma == 0
+^k_uniform wmma == 0
+^k_asm wmma == 1

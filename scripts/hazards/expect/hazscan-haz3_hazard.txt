@@ -1,0 +1,16 @@
+# expectations for scripts/hazards/haz_hazscan.py on src/hazards/haz3_hazard.hip (gfx1100), all four builds
+# straight line: the compiler separates the two matrix instructions (v_nop + s_delay_alu)
+^h_straight hazard == 0
+# the deliberate break (inline assembly without the V_NOP)
+^h_asm_raw hazard == 1
+^h_asm_nop hazard == 0
+# callee that copies the result to the return registers: no pending result at the return
+^first_mm\( return == 0
+# callee that ends with the matrix instruction and returns: nothing between it and the caller's next instruction
+^first_mm_tied return == 1
+# call sites: the scan flags a matrix instruction reached with no VALU on the way. In h_call and h_call2 only four
+# loads and an s_waitcnt sit between (the card result is right there); in h_call3 and h_call4 nothing does (wrong).
+^h_call\( call == 1
+^h_call2 call == 1
+^h_call3 call == 1
+^h_call4 call == 1
